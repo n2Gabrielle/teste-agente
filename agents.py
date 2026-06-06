@@ -36,14 +36,62 @@ def documentation_tool(url: str) -> str:
     response = get_response_from_openai(messages)
     return response.content
 
+@tool
+def quality_assessment_tool(user_stories: str) -> str:
+    """
+    Avalia a qualidade das User Stories usando o framework QUS.
+    Atribui 1 ponto por critério atendido e justifica detalhadamente cada decisão.
+    """
+    messages = [
+        SystemMessage(content="Você é um auditor de qualidade de requisitos especialista no framework QUS."),
+        HumanMessage(content=f"""
+            Analise as seguintes User Stories sob os 7 critérios QUS (cada um vale EXATAMENTE 1 ponto).
+            
+            Para cada User Story, você deve gerar um relatório contendo:
+            1. **Pontuação Total** (X de 7 pontos).
+            2. **Análise por Critério**: Liste cada um dos 7 critérios e indique se foi 'Atendido' ou 'Não Atendido'.
+            3. **Justificativa (O motivo)**: Para cada critério, explique a razão da nota. 
+               - Ex: Se 'Não Atendido em Atômica', explique que a história contém múltiplas funcionalidades.
+               - Ex: Se 'Atendido em Bem-formada', confirme que possui Persona, Ação e Benefício.
+
+            Critérios de Avaliação:
+            1. Bem-formada | 2. Atômica | 3. Conceitualmente Sólida | 4. Inambígua 
+            5. Mínima | 6. Sentença Completa | 7. Estimável.
+
+            User Stories para avaliar:
+            {user_stories}
+
+            Ao final do relatório, apresente:
+            - O somatório total de pontos de todas as histórias.
+            - O cálculo da Taxa de Sucesso: (Soma total / (N de histórias * 7)) * 100.
+            - Resultado final em porcentagem.
+        """)
+    ]
+    response = get_response_from_openai(messages)
+    return response.content  
+
 # CONFIGURAÇÃO DO AGENTE
-toolkit = [documentation_tool]
+toolkit = [documentation_tool, quality_assessment_tool]
 
 prompt = ChatPromptTemplate.from_messages([
     ("system", """
-    Use suas ferramentas para criar user stories.
-    Se você não tiver uma ferramenta para responder, diga que não tem uma ferramenta para isso.
-    Retorne apenas as user stories, sem nenhum texto adicional.
+Seu fluxo de trabalho obrigatório é:
+    1. Executar a 'documentation_tool' para gerar as User Stories.
+    2. Executar a 'quality_assessment_tool' passando as histórias geradas.
+    
+    ESTRUTURA DE RESPOSTA (Siga estritamente esta ordem no output):
+    
+    # BACKLOG DE USER STORIES
+    (Apresente aqui a lista completa de todas as User Stories geradas, sem interrupções).
+    
+    # AVALIAÇÃO INDIVIDUAL QUS
+    (Para cada User Story da lista acima, apresente a avaliação detalhada da ferramenta de qualidade, 
+    incluindo a pontuação X/7 e as justificativas de por que cada critério foi ou não atendido).
+    
+    # PONTUAÇÃO GERAL DO PROJETO
+    (Apresente o somatório total de pontos, o total de histórias analisadas e a Taxa de Sucesso QUS final em %).
+    
+    Regra: Não adicione textos introdutórios ou conclusões informais. Foque na estrutura técnica acima.
     """),
     ("human", "{input}"),
     MessagesPlaceholder(variable_name="agent_scratchpad"),

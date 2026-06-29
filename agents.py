@@ -47,7 +47,7 @@ def user_story_generation_tool(structured_context: str) -> str:
     Recebe o Contexto Estruturado e gera o Backlog de User Stories formal com critérios de aceitação.
     """
     messages = [
-        SystemMessage(content="Você é um Analista de Sistemas Ágil. Você escreve User Stories baseadas em Contexto Estruturado."),
+        SystemMessage(content="Você é um Analista de Sistemas Ágil especialista em fatiamento de escopo (Splitting User Stories). Sua função é gerar histórias pequenas, focadas em apenas UMA ação do usuário por frase. Evite     verbos amplos como 'gerenciar', 'centralizar' ou 'manter' que embutem múltiplos fluxos (CRUD). Em vez disso, quebre-os em ações menores (ex: em vez de 'gerenciar materiais', crie uma US para 'adicionar materiais' e outra para 'remover materiais')."),
         HumanMessage(content=f"""Com base no Contexto Estruturado abaixo, gere as User Stories necessárias usando o padrão 'Como [Ator], quero [Ação], para que [Benefício]'. Adicione 2 critérios de aceitação simples por história.
         
         {structured_context}

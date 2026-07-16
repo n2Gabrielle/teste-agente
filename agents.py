@@ -1,9 +1,12 @@
 import os
+import time
+import tracemalloc
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain.agents import AgentExecutor, create_openai_tools_agent
 from langchain_openai import ChatOpenAI
 from langchain.tools import tool
+from langchain_community.callbacks.manager import get_openai_callback
 
 # CONFIGURAÇÃO GLOBAL (Utilizando gpt-4o-mini para melhor inteligência e custo-benefício)
 os.environ["OPENAI_API_KEY"] = "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"
@@ -13,7 +16,7 @@ def get_response_from_openai(messages):
     return llm.invoke(messages)
 
 def get_text_from_url(url: str) -> str:
-    # Mantendo o mock para o  ambiente local 
+    # Mantendo o mock para o ambiente local 
     return "Texto bruto extraído do documento acadêmico da UFF com requisitos sobre centralização de materiais e regras como e-mail @id.uff.br obrigatório."
 
 @tool
@@ -47,7 +50,7 @@ def user_story_generation_tool(structured_context: str) -> str:
     Recebe o Contexto Estruturado e gera o Backlog de User Stories formal com critérios de aceitação.
     """
     messages = [
-        SystemMessage(content="Você é um Analista de Sistemas Ágil especialista em fatiamento de escopo (Splitting User Stories). Sua função é gerar histórias pequenas, focadas em apenas UMA ação do usuário por frase. Evite     verbos amplos como 'gerenciar', 'centralizar' ou 'manter' que embutem múltiplos fluxos (CRUD). Em vez disso, quebre-os em ações menores (ex: em vez de 'gerenciar materiais', crie uma US para 'adicionar materiais' e outra para 'remover materiais')."),
+        SystemMessage(content="Você é um Analista de Sistemas Ágil especialista em fatiamento de escopo (Splitting User Stories). Sua função é gerar histórias pequenas, focadas em apenas UMA ação do usuário por frase. Evite verbos amplos como 'gerenciar', 'centralizar' ou 'manter' que embutem múltiplos fluxos (CRUD). Em vez disso, quebre-os em ações menores (ex: em vez de 'gerenciar materiais', crie uma US para 'adicionar materiais' e outra para 'remover materiais')."),
         HumanMessage(content=f"""Com base no Contexto Estruturado abaixo, gere as User Stories necessárias usando o padrão 'Como [Ator], quero [Ação], para que [Benefício]'. Adicione 2 critérios de aceitação simples por história.
         
         {structured_context}
@@ -84,6 +87,39 @@ Você deve caçar absurdos lógicos, ações fisicamente impossíveis (ex: objet
 
             Atribua um status claro de [APROVADO SEMANTICAMENTE] ou [REPROVADO SEMANTICAMENTE] para cada história.
             Se houver reprovação devido a um absurdo semântico, justifique o erro encontrado.
+        """)
+    ]
+    return get_response_from_openai(messages).content
+
+@tool
+def requirements_coverage_tool(user_stories: str, structured_context: str) -> str:
+    """
+    Monta uma Matriz de Rastreabilidade (RTM) e verifica se 100% dos requisitos, atores e 
+    regras definidos no Contexto Estruturado foram cobertos por pelo menos uma User Story.
+    """
+    messages = [
+        SystemMessage(content="Você é um Engenheiro de Garantia de Qualidade de Requisitos e especialista em Rastreabilidade de Modelos."),
+        HumanMessage(content=f"""
+            Crie uma Matriz de Rastreabilidade ligando as Regras de Negócio Invioláveis e os Escopos Macros do Contexto Estruturado às User Stories geradas.
+            
+            CONTEXTO ESTRUTURADO ORIGINAL:
+            ---
+            {structured_context}
+            ---
+
+            USER STORIES GERADAS:
+            ---
+            {user_stories}
+            ---
+
+            Analise se há alguma lacuna. Se alguma regra de negócio ou escopo macro não puder ser mapeado a nenhuma User Story, aponte explicitamente como "GAP DE COBERTURA DETECTADO".
+            
+            Retorne:
+            1. Uma tabela Markdown de rastreabilidade (Item do Contexto -> US Relacionada).
+            2. Um veredito de cobertura (Se há lacunas ou se está 100% Coberto).
+            
+            IMPORTANTE: Termine seu retorno com a seguinte tag (calcule a porcentagem de itens do contexto cobertos):
+            [RASTREABILIDADE: X% COBERTO]
         """)
     ]
     return get_response_from_openai(messages).content
@@ -143,8 +179,15 @@ def invest_assessment_tool(user_stories: str) -> str:
     ]
     return get_response_from_openai(messages).content
 
-# CONFIGURAÇÃO DO AGENTE ATUALIZADO (Incluída a validação semântica cruzada)
-toolkit = [context_extraction_tool, user_story_generation_tool, semantic_consistency_tool, quality_assessment_tool, invest_assessment_tool]
+# CONFIGURAÇÃO DO AGENTE ATUALIZADO (Incluída a nova ferramenta no toolkit)
+toolkit = [
+    context_extraction_tool, 
+    user_story_generation_tool, 
+    semantic_consistency_tool, 
+    requirements_coverage_tool, 
+    quality_assessment_tool, 
+    invest_assessment_tool
+]
 
 prompt = ChatPromptTemplate.from_messages([
     ("system", """
@@ -153,31 +196,36 @@ Seu fluxo de trabalho é estrito, ordenado e obrigatório:
     1. Execute a 'context_extraction_tool' passando a URL enviada pelo usuário.
     2. Envie o contexto gerado para a 'user_story_generation_tool'.
     3. Envie as histórias geradas E o contexto estruturado da etapa 1 para a 'semantic_consistency_tool' para caçar absurdos lógicos e garantir o alinhamento de nexo do domínio.
-    4. Envie as histórias geradas para a 'quality_assessment_tool' (Auditoria QUS).
-    5. Envie as MESMAS histórias geradas para a 'invest_assessment_tool' (Auditoria INVEST).
+    4. Envie as histórias geradas E o contexto estruturado da etapa 1 para a 'requirements_coverage_tool' para garantir a cobertura integral de requisitos.
+    5. Envie as histórias geradas para a 'quality_assessment_tool' (Auditoria QUS).
+    6. Envie as MESMAS histórias geradas para a 'invest_assessment_tool' (Auditoria INVEST).
     
     ESTRUTURA DE RESPOSTA FINAL (Siga rigorosamente esta estrutura enxuta no output final):
     
-    ### 3.4. Resultados e Métricas do Estudo Piloto (Pipeline de Agente com Validação Semântica)
+    ### 3.4. Resultados e Métricas do Estudo Piloto (Pipeline de Agente com Validação Semântica e Cobertura)
 
-    A execução do pipeline automatizado processou o escopo do projeto da UFF, gerou um backlog de User Stories (US) e aplicou uma tripla camada de auditoria. Os resultados consolidados são apresentados abaixo:
+    A execução do pipeline automatizado processou o escopo do projeto da UFF, gerou um backlog de User Stories (US) e aplicou uma tripla camada de auditoria analítica e de cobertura. Os resultados consolidados são apresentados abaixo:
 
     #### 1. Consolidação Quantitativa das Métricas
     - [MÉTRICAS QUS: ... ]
     - [MÉTRICAS INVEST: ... ]
+    - [RASTREABILIDADE: ... ]
 
     #### 2. Relatório de Validação de Domínio e Nexo Semântico
-    (Apresente aqui o resumo do resultado obtido na 'semantic_consistency_tool' indicando se o nexo lógico das histórias foi integralmente aprovado ou se alguma bizarrice conceitual foi encontrada).
+    (Apresente aqui o resumo do resultado obtido na 'semantic_consistency_tool' de forma resumida).
 
-    #### 3. Relatório de Auditoria Simplificado (Métricas Estruturais)
+    #### 3. Matriz de Cobertura de Requisitos
+    (Apresente o resultado obtido pela 'requirements_coverage_tool' mostrando o mapeamento de cobertura e se houve algum GAP).
+
+    #### 4. Relatório de Auditoria Simplificado (Métricas Estruturais)
     Monte uma tabela Markdown comparativa consolidando os dados das ferramentas QUS e INVEST com as colunas exatas:
     | ID da US | Funcionalidade Principal | Avaliação QUS (Total: 7) | Avaliação INVEST (Total: 6) | Critério com Falha detectado |
 
-    #### 4. Diagnóstico Técnico dos Resultados
+    #### 5. Diagnóstico Técnico dos Resultados
     Apresente uma justificativa analítica curta (em tópicos) explicando:
     - Por que a métrica QUS atingiu o resultado obtido.
     - Por que a métrica INVEST variou ou se comportou dessa forma.
-    - Como a nova camada de consistência semântica impede que histórias sintaticamente perfeitas mas absurdas (ex: "lápis que dirige") passem pelo pipeline sem supervisão.
+    - Como o rastreamento ativo de cobertura de requisitos previne falhas de omissão de escopo comuns em geradores baseados em LLM.
     
     Termine com uma breve conclusão sobre o papel estratégico e insubstituível do engenheiro humano no refino final do fatiamento do backlog.
     """),
@@ -187,11 +235,8 @@ Seu fluxo de trabalho é estrito, ordenado e obrigatório:
 
 agent = create_openai_tools_agent(llm, toolkit, prompt)
 agent_executor = AgentExecutor(agent=agent, tools=toolkit, verbose=True)
-if __name__ == "__main__":
-    import time
-    import tracemalloc
-    from langchain_community.callbacks.manager import get_openai_callback
 
+if __name__ == "__main__":
     url_teste = "https://docs.google.com/document/d/e/2PACX-1vTwj4Yh9UVPzqEpHJMprp875O7bW6XRQek_JNl-1ZxriLWvXvWInIxlxaYY4-yTRRTvxNIvUSPkuFbm/pub"
     
     # 1. Inicia o monitoramento de Hardware (Memória e Tempo)
@@ -203,7 +248,7 @@ if __name__ == "__main__":
         
         # Execução do Pipeline do Agente
         result = agent_executor.invoke({
-            "input": f"Execute todo o pipeline de engenharia de requisitos com tripla auditoria (Semântica + QUS + INVEST) para o projeto em: {url_teste}"
+            "input": f"Execute todo o pipeline de engenharia de requisitos com auditoria semântica, de cobertura, QUS e INVEST para o projeto em: {url_teste}"
         })
         
         # Finaliza a medição de tempo e hardware logo após a execução do agente
@@ -212,7 +257,6 @@ if __name__ == "__main__":
         tracemalloc.stop()
         
         # 3. Cálculo matemático manual do custo real do gpt-4o-mini
-        # Preço por token: Entrada = $0.15 / 1.000.000 | Saída = $0.60 / 1.000.000
         custo_entrada = (cb.prompt_tokens / 1000000) * 0.15
         custo_saida = (cb.completion_tokens / 1000000) * 0.60
         custo_real_calculado = custo_entrada + custo_saida
@@ -229,6 +273,5 @@ if __name__ == "__main__":
         print(f"Total de Tokens Usados: {cb.total_tokens}")
         print(f"Tokens de Entrada (Prompt): {cb.prompt_tokens}")
         print(f"Tokens de Saída (Completion): {cb.completion_tokens}")
-        # Exibe o custo com formatador de 6 casas decimais para capturar frações de centavos
         print(f"Custo Total Estimado (Nativo LangChain): ${cb.total_cost:.5f} USD")
         print(f"Custo Total Real (Calculado gpt-4o-mini): ${custo_real_calculado:.6f} USD")

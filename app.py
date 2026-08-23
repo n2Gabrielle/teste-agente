@@ -25,7 +25,7 @@ from langchain_community.callbacks.manager import get_openai_callback
 # Configuração da página do Streamlit
 st.set_page_config(
     page_title="Sandbox de Engenharia de Requisitos Ágeis - UFF",
-    page_icon="🤖",
+    page_icon="",
     layout="wide"
 )
 
@@ -163,68 +163,100 @@ def context_extraction_tool(url: str) -> str:
 @tool
 def user_story_generation_tool(structured_context: str) -> str:
     """
-    Recebe o Contexto Estruturado e gera User Stories alinhadas estritamente aos critérios QUS e INVEST.
+    Recebe o Contexto Estruturado e gera User Stories alinhadas estritamente aos critérios QUS e INVEST,
+    respeitando rigorosamente o escopo fornecido.
     """
 
     messages = [
         SystemMessage(content="""
-Você é um Especialista em Engenharia de Requisitos Ágeis focado na criação de User Stories de altíssima qualidade (QUS 7/7 e INVEST 6/6).
-
-Sua responsabilidade é gerar o backlog do projeto seguindo RIGOROSAMENTE o escopo fornecido.
+Você é um Compilador Estrito de Requisitos Ágeis. Seu objetivo é gerar User Stories que gabaritem 7/7 no QUS e 6/6 no INVEST sem NENHUMA exceção sintática e sem NENHUMA violação ou invenção de escopo.
 
 ====================================================
-1. REGRAS DE ESCOPO
+1. TRAVA ABSOLUTA DE ESCOPO E DELIMITAÇÃO (ZERO ALUCINAÇÃO)
 ====================================================
-- Gere apenas funcionalidades presentes no escopo fornecido.
-- Utilize apenas os atores identificados no contexto.
-- Nunca invente funcionalidades ou requisitos técnicos (ex: tempo real, dashboard, notificações, PDF, API, IA, aplicativo mobile, exceto quando citados explicitamente no escopo).
-- Numere as histórias em sequência: US-01, US-02, US-03...
+- GERE APENAS HISTÓRIAS DE FUNCIONALIDADES EXPLICITAMENTE DESCRITAS NO CONTEXTO.
+- NUNCA invente módulos administrativos, relatórios de vendas, dashboards, gestão de estoque ou cadastros de terceiros se não estiverem explícitos no documento.
+- RESPEITE AS RESTRIÇÕES DE NEGÓCIO: Se o texto proibir o cadastro de um determinado tipo de usuário (ex: "não permitir cadastro de vendedoras"), NUNCA crie histórias para essa ação.
+- ATENÇÃO AOS ATORES: Crie histórias apenas para os atores explicitamente autorizados a realizar ações no contexto.
 
 ====================================================
-2. REGRAS RÍGIDAS DE COMPOSIÇÃO (INVEST SMALL & QUS ATÔMICA)
+2. PROIBIÇÃO ABSOLUTA DE CONECTIVOS (BLOCKED TOKENS)
 ====================================================
-A) UMA HISTÓRIA = UMA AÇÃO E UM BENEFÍCIO EXCLUSIVOS
-   - NUNCA misture Leitura e Escrita na mesma história (ex: NUNCA crie "quero ver e avaliar professores"). Separe em histórias distintas.
-   - NO TEXTO DA USER STORY ("quero" e "para que"): É PROIBIDO o uso de conectivos como "e", "bem como", "também", "ou" para juntar duas ações ou dois benefícios distintos.
-   
-B) CRITÉRIOS DE ACEITAÇÃO DELIMITADOS
-   - Gere exatamente DOIS critérios de aceitação por história.
-   - Os critérios de aceitação DEVEM APENAS testar a ação exata descrita no 'quero'.
-   - NOS CRITÉRIOS DE ACEITAÇÃO: É PERMITIDO o uso da palavra "e" para detalhar regras, validações e respostas do sistema para aquela funcionalidade específica.
-   - PROIBIDO introduzir novas ações ou novos módulos não citados na história.
+É ESTRITAMENTE PROIBIDO escrever as palavras abaixo nos campos "quero" e "para que":
+❌ PROIBIDOS: " e ", " ou ", "bem como", "como também", "além de", "junto com", " / "
 
-C) LINGUAGEM INAMBÍGUA
-   - NUNCA utilize adjetivos vagos no texto ou critérios: "claro", "acessível", "eficiente", "fácil", "rápido", "intuitivo".
-   - Para atualização de dados, NUNCA use "tempo real" ou "instantâneo". Use expressões objetivas como: "no momento da consulta".
+SE VOCÊ ESCREVER A PALAVRA " E " OU A PALAVRA " OU " DENTRO DO QUERO OU DO PARA QUE, A HISTÓRIA SERÁ REPROVADA AUTOMATICAMENTE.
+
+Como corrigir no momento da escrita:
+- Em vez de: "quero receber em casa OU retirar no brechó"
+  Escreva: "quero selecionar a modalidade de entrega do pedido"
+- Em vez de: "para que eu possa finalizar a transação E adquirir os itens"
+  Escreva: "para que eu possa concluir a compra dos itens"
+- Em vez de: "para que eu possa ver E avaliar"
+  Escreva: "para que eu possa analisar o item"
+
+====================================================
+3. ESTRUTURA E REGRAS DE CADA CAMPO
+====================================================
+
+A) COMO <ator>
+- Utilize apenas atores identificados e autorizados no contexto.
+
+B) QUERO <ação única>
+- Apenas UM verbo principal de ação.
+- Proibido qualquer tipo de lista, alternativa ou opções agrupadas.
+- Proibido usar "e", "ou".
+
+C) PARA QUE <benefício único>
+- Apenas UMA consequência direta da ação.
+- Proibido redundância (não diga a mesma coisa de duas formas ligadas por "e").
+- Proibido usar "e", "ou".
+
+D) CRITÉRIOS DE ACEITAÇÃO (Exatamente 2 por história)
+- Aqui (E APENAS AQUI) é permitido usar a palavra "e" para detalhar regras do sistema.
+- Proibido usar termos vagos: "fácil", "rápido", "eficiente", "intuitivo".
+
+====================================================
+4. EXEMPLO DE REATORAÇÃO PARA ATOMICIADADE MÁXIMA
+====================================================
+❌ ERRADO:
+Como cliente,
+quero escolher entre receber a roupa em casa ou retirar no brechó,
+para que eu possa finalizar a transação e adquirir os itens.
+
+✅ CORRETO (Sem nenhum 'e' / 'ou' no corpo):
+Como cliente,
+quero selecionar a modalidade de envio do pedido,
+para que eu possa definir a forma de recebimento da compra.
 
 ====================================================
 FORMATO DE SAÍDA ESPERADO
 ====================================================
 US-01
 Como <ator>,
-quero <ação única e sem conectivo e>,
-para que <benefício único e sem conectivo e>.
+quero <ação estritamente sem as palavras 'e' e 'ou'>,
+para que <benefício estritamente sem as palavras 'e' e 'ou'>.
 
 Critérios de Aceitação:
-1. <Critério objetivo focado na ação>
-2. <Critério objetivo de verificação/erro>
+1. <Validação da ação>
+2. <Regra de negócio ou tratamento de erro>
 
-(Repita para todas as User Stories)
+(Repita para todas as User Stories VÁLIDAS do escopo)
 """),
 
         HumanMessage(content=f"""
 Contexto Estruturado:
-
 -------------------------
 {structured_context}
 -------------------------
 
-Gere todas as User Stories aplicando estritamente as regras de composição para gabaritar QUS e INVEST.
+Gere o backlog aplicando o filtro de escopo rigoroso e a proibição de conectivos no 'quero' e 'para que' para garantir 100% de aprovação no QUS (7/7), INVEST (6/6) e na validação semântica.
 """)
     ]
 
     return get_response_from_openai(messages).content
 
+    return get_response_from_openai(messages).content
 @tool
 def semantic_consistency_tool(user_stories: str, structured_context: str) -> str:
     """

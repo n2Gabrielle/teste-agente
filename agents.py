@@ -212,8 +212,8 @@ agent_executor = create_react_agent(llm, toolkit, state_modifier=prompt)
 
 # --- INTERFACE DO STREAMLIT ---
 
-st.title("🤖 Sandbox de Engenharia de Requisitos Ágeis - UFF")
-st.subheader("Geração e Auditoria de Backlog via Agentes Multi-Ferramentas")
+st.title("Geração de Histórias de Usuário - UFF")
+st.subheader("Agente Multi-Ferramentas")
 st.markdown("---")
 
 # Input para o link do documento de requisitos

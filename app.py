@@ -14,6 +14,7 @@ import re
 import requests
 from bs4 import BeautifulSoup
 import streamlit as st
+from dotenv import load_dotenv
 
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -25,20 +26,35 @@ from langchain_community.callbacks.manager import get_openai_callback
 # Configuração da página do Streamlit
 st.set_page_config(
     page_title="Sandbox de Engenharia de Requisitos Ágeis - UFF",
-    page_icon="",
+    page_icon="🧪",
     layout="wide"
 )
 
-# CONFIGURAÇÃO DE SEGURANÇA DA API OPENAI
+# ---------------------------------------------------------
+# CONFIGURAÇÃO SECURA DA API KEY
+# ---------------------------------------------------------
+load_dotenv()  # Carrega variáveis do arquivo .env (se rodando localmente)
+
+api_key = None
+
 try:
-    if "OPENAI_API_KEY" in st.secrets:
-        os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
+    if "OPENAI_API_KEY" in st.secrets and st.secrets["OPENAI_API_KEY"]:
+        api_key = st.secrets["OPENAI_API_KEY"]
 except Exception:
-    # Chave padrão para desenvolvimento local caso não encontre secrets.toml
-    os.environ["OPENAI_API_KEY"] = "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"
+    pass
+
+if not api_key:
+    api_key = os.getenv("OPENAI_API_KEY")
+
+# Validação para interromper com mensagem amigável caso nenhuma chave seja configurada
+if not api_key:
+    st.error(" Chave da OpenAI não configurada. Adicione nos Secrets do Streamlit Cloud ou no arquivo .env local.")
+    st.stop()
+
+os.environ["OPENAI_API_KEY"] = api_key
 
 # Inicialização do Modelo
-llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, openai_api_key=api_key)
 
 def get_response_from_openai(messages):
     return llm.invoke(messages)
@@ -256,7 +272,6 @@ Gere o backlog aplicando o filtro de escopo rigoroso e a proibição de conectiv
 
     return get_response_from_openai(messages).content
 
-    return get_response_from_openai(messages).content
 @tool
 def semantic_consistency_tool(user_stories: str, structured_context: str) -> str:
     """

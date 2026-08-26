@@ -397,7 +397,6 @@ Retorne exatamente neste formato:
 [
     {{
         "Regra":"Disponibilizar campus e sala",
-        "Tipo":"Inclusão",
         "UserStory":"US-01",
         "Observacao":"Relaciona-se diretamente..."
     }}

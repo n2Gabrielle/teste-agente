@@ -16,11 +16,7 @@ st.set_page_config(
     layout="wide"
 )
 
-# CONFIGURAÇÃO GLOBAL (Chave da API)
-# Nota: É recomendável usar st.secrets para produção, mas mantive sua chave padrão aqui para rodar direto.
-os.environ["OPENAI_API_KEY"] = "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"
 
-# Inicialização do Modelo
 llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
 def get_response_from_openai(messages):

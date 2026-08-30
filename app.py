@@ -33,22 +33,24 @@ st.set_page_config(
 # ---------------------------------------------------------
 # CONFIGURAÇÃO SECURA DA API KEY
 # ---------------------------------------------------------
-load_dotenv()  # Carrega variáveis do arquivo .env (se rodando localmente)
+# override=True força o Python a ler o .env local primeiro,
+# ignorando variáveis velhas do ambiente do SO
+load_dotenv(override=True)
 
-api_key = None
+# 1. Tenta obter a chave do arquivo .env local
+api_key = os.getenv("OPENAI_API_KEY")
 
-try:
-    if "OPENAI_API_KEY" in st.secrets and st.secrets["OPENAI_API_KEY"]:
-        api_key = st.secrets["OPENAI_API_KEY"]
-except Exception:
-    pass
-
+# 2. Se não encontrou no .env local, busca nos Secrets do Streamlit Cloud
 if not api_key:
-    api_key = os.getenv("OPENAI_API_KEY")
+    try:
+        if "OPENAI_API_KEY" in st.secrets and st.secrets["OPENAI_API_KEY"]:
+            api_key = st.secrets["OPENAI_API_KEY"]
+    except Exception:
+        pass
 
 # Validação para interromper com mensagem amigável caso nenhuma chave seja configurada
 if not api_key:
-    st.error(" Chave da OpenAI não configurada. Adicione nos Secrets do Streamlit Cloud ou no arquivo .env local.")
+    st.error("🔑 Chave da OpenAI não configurada. Adicione nos Secrets do Streamlit Cloud ou no arquivo .env local.")
     st.stop()
 
 os.environ["OPENAI_API_KEY"] = api_key

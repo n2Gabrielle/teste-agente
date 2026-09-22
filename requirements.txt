@@ -1,2 +1,12 @@
 
 beautifulsoup4
+streamlit
+python-dotenv
+beautifulsoup4
+faiss-cpu
+langchain
+langchain-community
+langchain-openai
+openai
+pydantic
+requests

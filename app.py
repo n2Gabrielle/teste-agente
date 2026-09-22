@@ -2,7 +2,6 @@ import sys
 import os
 
 # Remove o diretório atual do topo da busca de caminhos do Python
-# Isso impede conflitos de nomes com bibliotecas do LangChain
 diretorio_atual = os.path.dirname(os.path.abspath(__file__))
 if diretorio_atual in sys.path:
     sys.path.remove(diretorio_atual)
@@ -22,25 +21,26 @@ from langchain.agents import AgentExecutor, create_openai_tools_agent
 from langchain_openai import ChatOpenAI
 from langchain.tools import tool
 from langchain_community.callbacks.manager import get_openai_callback
+from langchain_community.vectorstores import FAISS
+from langchain_openai import OpenAIEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+VECTOR_STORE = None
 
 # Configuração da página do Streamlit
 st.set_page_config(
     page_title="Sandbox de Engenharia de Requisitos Ágeis - UFF",
-    page_icon="🧪",
+    page_icon="",
     layout="wide"
 )
 
 # ---------------------------------------------------------
-# CONFIGURAÇÃO SECURA DA API KEY
+# CONFIGURAÇÃO SEGURA DA API KEY
 # ---------------------------------------------------------
-# override=True força o Python a ler o .env local primeiro,
-# ignorando variáveis velhas do ambiente do SO
 load_dotenv(override=True)
 
-# 1. Tenta obter a chave do arquivo .env local
 api_key = os.getenv("OPENAI_API_KEY")
 
-# 2. Se não encontrou no .env local, busca nos Secrets do Streamlit Cloud
 if not api_key:
     try:
         if "OPENAI_API_KEY" in st.secrets and st.secrets["OPENAI_API_KEY"]:
@@ -48,41 +48,32 @@ if not api_key:
     except Exception:
         pass
 
-# Validação para interromper com mensagem amigável caso nenhuma chave seja configurada
 if not api_key:
-    st.error("🔑 Chave da OpenAI não configurada. Adicione nos Secrets do Streamlit Cloud ou no arquivo .env local.")
+    st.error(" Chave da OpenAI não configurada. Adicione nos Secrets do Streamlit Cloud ou no arquivo .env local.")
     st.stop()
 
 os.environ["OPENAI_API_KEY"] = api_key
 
-# Inicialização do Modelo
 llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, openai_api_key=api_key)
 
 def get_response_from_openai(messages):
     return llm.invoke(messages)
 
 def get_text_from_url(url: str) -> str:
-    """
-    Acessa uma URL pública (ex: Google Docs publicado na Web ou site),
-    baixa o conteúdo HTML e extrai o texto limpo de requisitos.
-    """
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
-        response = requests.get(url, headers=headers, timeout=12)
+        response = requests.get(url, headers=headers, timeout=15)
         response.raise_for_status()
         
-        # Parse do HTML com BeautifulSoup
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # Remove elementos irrelevantes do HTML
         for element in soup(["script", "style", "nav", "footer", "header"]):
             element.decompose()
             
         text = soup.get_text(separator=' ')
         
-        # Limpeza de espaços e quebras de linha em excesso
         lines = (line.strip() for line in text.splitlines())
         chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
         cleaned_text = '\n'.join(chunk for chunk in chunks if chunk)
@@ -95,390 +86,236 @@ def get_text_from_url(url: str) -> str:
     except Exception as e:
         return f"Erro ao extrair conteúdo da URL ({url}): {str(e)}"
 
-# --- PARSER PYTHON PARA CORREÇÃO MATEMÁTICA DE MÉTRICAS ---
 
 def recalcular_metricas_markdown(texto_metricas: str) -> str:
-    """
-    Extrai as notas da tabela Markdown de auditoria e garante que os totais do
-    cabeçalho de 'Consolidação Quantitativa das Métricas' sejam calculados
-    com 100% de precisão matemática via Python.
-    """
     linhas = texto_metricas.strip().split('\n')
     
     notas_qus = []
     notas_invest = []
     
-    # Varre as linhas procurando dados de histórias (ex: | US-01 | ... | 7 | 6 | ...)
     for linha in linhas:
-        if "|" in linha and ("US-" in linha or "US_" in linha or re.search(r'US\d+', linha, re.IGNORECASE)):
+        # Regex flexível para capturar variações de identificadores das USs
+        if "|" in linha and re.search(r'US-?\d+', linha, re.IGNORECASE):
             colunas = [c.strip() for c in linha.split('|')]
-            # Remove elementos vazios do split caso as bordas venham com '|'
             if colunas and colunas[0] == '':
                 colunas.pop(0)
             if colunas and colunas[-1] == '':
                 colunas.pop()
                 
-            # Verifica se existem colunas suficientes para ler as notas (devem ser a 3ª e 4ª colunas)
             if len(colunas) >= 4:
-                try:
-                    qus = int(re.search(r'\d+', colunas[2]).group())
-                    invest = int(re.search(r'\d+', colunas[3]).group())
-                    notas_qus.append(qus)
-                    notas_invest.append(invest)
-                except (AttributeError, ValueError):
-                    continue
+                match_qus = re.search(r'(\d+)\s*/\s*7', colunas[1]) or re.search(r'(\d+)', colunas[1])
+                match_invest = re.search(r'(\d+)\s*/\s*6', colunas[3]) or re.search(r'(\d+)', colunas[3])
+                
+                if match_qus:
+                    notas_qus.append(int(match_qus.group(1)))
+                if match_invest:
+                    notas_invest.append(int(match_invest.group(1)))
 
-    # Se conseguiu capturar as notas da tabela, faz a substituição exata
     if notas_qus and notas_invest:
         total_qus = sum(notas_qus)
         max_qus = len(notas_qus) * 7
         total_invest = sum(notas_invest)
         max_invest = len(notas_invest) * 6
         
-        # Substituição com Regex no texto para garantir a precisão
         texto_metricas = re.sub(
-            r'MÉTRICAS QUS:\s*\d+\s*/\s*\d+', 
-            f'MÉTRICAS QUS: {total_qus} / {max_qus}', 
-            texto_metricas, 
-            flags=re.IGNORECASE
+            r'- MÉTRICAS QUS:.*', 
+            f'- MÉTRICAS QUS: {total_qus} / {max_qus}', 
+            texto_metricas
         )
         texto_metricas = re.sub(
-            r'MÉTRICAS INVEST:\s*\d+\s*/\s*\d+', 
-            f'MÉTRICAS INVEST: {total_invest} / {max_invest}', 
-            texto_metricas, 
-            flags=re.IGNORECASE
+            r'- MÉTRICAS INVEST:.*', 
+            f'- MÉTRICAS INVEST: {total_invest} / {max_invest}', 
+            texto_metricas
         )
         
     return texto_metricas
 
-# --- DEFINIÇÃO DAS FERRAMENTAS DO AGENTE ---
+# --- FERRAMENTAS DO AGENTE ---
+@tool
+def rag_indexing_tool(url: str) -> str:
+    """
+    Acessa a URL, realiza o chunking do documento e cria a base vetorial FAISS em memória.
+    """
+    global VECTOR_STORE
+    raw_text = get_text_from_url(url)
+    
+    if raw_text.startswith("Erro") or raw_text.startswith("Aviso"):
+        return raw_text
+
+    # Fragmentação adaptativa
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=600,
+        chunk_overlap=100,
+        separators=["\n\n", "\n", ".", ";", " "]
+    )
+    docs = text_splitter.create_documents([raw_text])
+    
+    # Geração do Vector Store
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+    VECTOR_STORE = FAISS.from_documents(docs, embeddings)
+    
+    return f"Indexação RAG concluída com sucesso. Total de {len(docs)} fragmentos processados."
 
 @tool
-def context_extraction_tool(url: str) -> str:
+def normative_analysis_tool(query_escopo: str) -> str:
     """
-    Acessa a URL, extrai o texto bruto e gera um artefato de Contexto Estruturado
-    (Atores, Regras de Negócio Invioláveis e Escopo Macro).
+    Realiza busca vetorial no documento para identificar lacunas normativas, 
+    regras ausentes ou contradições antes de gerar os requisitos.
     """
-    raw_context = get_text_from_url(url)
+    global VECTOR_STORE
+    if not VECTOR_STORE:
+        return "Erro: Base vetorial não inicializada. Execute rag_indexing_tool primeiro."
+
+    # Recuperação dos trechos mais relevantes do escopo
+    docs_relevantes = VECTOR_STORE.similarity_search(query_escopo, k=6)
+    contexto_recuperado = "\n---\n".join([d.page_content for d in docs_relevantes])
+
     messages = [
-        SystemMessage(content="Você é um Engenheiro de Requisitos Sênior especializado em modelagem de domínio."),
-        HumanMessage(content=f"""Analise o texto abaixo e extraia o contexto estruturado:
-    ---
-    {raw_context}
-    ---
-    Retorne no formato:
-    # CONTEXTO ESTRUTURADO DO PROJETO
-    ## 1. ATORES DO SISTEMA
-    - [Atores]
-    ## 2. REGRAS DE NEGÓCIO E RESTRIÇÕES INVIOLÁVEIS
-    - [Regras]
-    ## 3. ESCOPO MACRO (FUNCIONALIDADES)
-    - [Módulos]
-    """)
+        SystemMessage(content="""
+Você é um Engenheiro de Requisitos especialista em Análise Normativa e Auditoria Primária.
+Examine o texto recuperado do documento de escopo e identifique:
+1. REGRAS OMISSAS OU INCOMPLETAS (Ex: regras de validação ausentes, fluxos alternativos não descritos).
+2. DUVIDAS / LACUNAS que precisam de confirmação do analista.
+3. CONTRADIÇÕES internas.
+
+Formato da resposta:
+# ANÁLISE NORMATIVA E DIAGNÓSTICO DE LACUNAS
+## 1. REGRAS IDENTIFICADAS E VALIDADAS
+- [Regras confirmadas no texto]
+## 2. LACUNAS E OMISSÕES DETECTADAS
+- [Ponto Omisso]: [Explicação da ausência e impacto na regra de negócio]
+## 3. PERGUNTAS DE REFINAMENTO SUGERIDAS
+- [Pergunta objetiva para o Analista/PO sanar a lacuna]
+"""),
+        HumanMessage(content=f"Contexto Recuperado via RAG:\n{contexto_recuperado}")
     ]
     return get_response_from_openai(messages).content
 
 @tool
-def user_story_generation_tool(structured_context: str) -> str:
+def user_story_rag_generation_tool(payload_contexto: str) -> str:
     """
-    Recebe o Contexto Estruturado e gera User Stories alinhadas estritamente aos critérios QUS e INVEST,
-    respeitando rigorosamente o escopo fornecido.
+    Gera um Backlog de Histórias de Usuário exaustivo e atômico, 
+    garantindo cobertura completa de todos os módulos e regras do documento.
     """
+    global VECTOR_STORE
+    if not VECTOR_STORE:
+        return "Erro: Base vetorial não inicializada."
+
+    # Busca abrangente para recuperar todos os módulos e regras de negócio
+    docs_relevantes = VECTOR_STORE.similarity_search(
+        "Módulos, funcionalidades, regras de negócio, personas e integrações", 
+        k=15
+    )
+    contexto_completo = "\n---\n".join([f"[Trecho {i+1}]: {d.page_content}" for i, d in enumerate(docs_relevantes)])
 
     messages = [
-        SystemMessage(content="""
-Você é um Compilador Estrito de Requisitos Ágeis. Seu objetivo é gerar User Stories que gabaritem 7/7 no QUS e 6/6 no INVEST sem NENHUMA exceção sintática e sem NENHUMA violação ou invenção de escopo.
+    SystemMessage(content="""
+Você é um Engenheiro de Requisitos Sênior especializado em detalhamento fino de software industrial.
+Sua missão é gerar um Backlog de Histórias de Usuário extremamente ESPECÍFICO, DETALHADO e com CRITÉRIOS DE ACEITAÇÃO RICOS baseados no contexto fornecido.
 
-====================================================
-1. TRAVA ABSOLUTA DE ESCOPO E DELIMITAÇÃO (ZERO ALUCINAÇÃO)
-====================================================
-- GERE APENAS HISTÓRIAS DE FUNCIONALIDADES EXPLICITAMENTE DESCRITAS NO CONTEXTO.
-- NUNCA invente módulos administrativos, relatórios de vendas, dashboards, gestão de estoque ou cadastros de terceiros se não estiverem explícitos no documento.
-- RESPEITE AS RESTRIÇÕES DE NEGÓCIO: Se o texto proibir o cadastro de um determinado tipo de usuário (ex: "não permitir cadastro de vendedoras"), NUNCA crie histórias para essa ação.
-- ATENÇÃO AOS ATORES: Crie histórias apenas para os atores explicitamente autorizados a realizar ações no contexto.
+EVITE GENERALISMOS:
+- PROIBIDO criar critérios de aceitação genéricos do tipo "O sistema deve permitir X".
+- CADA História de Usuário DEVE possuir de 2 a 4 Critérios de Aceitação (CA) detalhados contendo:
+  1. Campos obrigatórios/opcionais envolvidos.
+  2. Regras de validação, bloqueios ou pré-condições.
+  3. Formatos esperados ou comportamentos do sistema em caso de sucesso/erro.
 
-====================================================
-2. PROIBIÇÃO ABSOLUTA DE CONECTIVOS (BLOCKED TOKENS)
-====================================================
-É ESTRITAMENTE PROIBIDO escrever as palavras abaixo nos campos "quero" e "para que":
-❌ PROIBIDOS: " e ", " ou ", "bem como", "como também", "além de", "junto com", " / "
+FORMATO OBRIGATÓRIO:
 
-SE VOCÊ ESCREVER A PALAVRA " E " OU A PALAVRA " OU " DENTRO DO QUERO OU DO PARA QUE, A HISTÓRIA SERÁ REPROVADA AUTOMATICAMENTE.
-
-Como corrigir no momento da escrita:
-- Em vez de: "quero receber em casa OU retirar no brechó"
-  Escreva: "quero selecionar a modalidade de entrega do pedido"
-- Em vez de: "para que eu possa finalizar a transação E adquirir os itens"
-  Escreva: "para que eu possa concluir a compra dos itens"
-- Em vez de: "para que eu possa ver E avaliar"
-  Escreva: "para que eu possa analisar o item"
-
-====================================================
-3. ESTRUTURA E REGRAS DE CADA CAMPO
-====================================================
-
-A) COMO <ator>
-- Utilize apenas atores identificados e autorizados no contexto.
-
-B) QUERO <ação única>
-- Apenas UM verbo principal de ação.
-- Proibido qualquer tipo de lista, alternativa ou opções agrupadas.
-- Proibido usar "e", "ou".
-
-C) PARA QUE <benefício único>
-- Apenas UMA consequência direta da ação.
-- Proibido redundância (não diga a mesma coisa de duas formas ligadas por "e").
-- Proibido usar "e", "ou".
-
-D) CRITÉRIOS DE ACEITAÇÃO (Exatamente 2 por história)
-- Aqui (E APENAS AQUI) é permitido usar a palavra "e" para detalhar regras do sistema.
-- Proibido usar termos vagos: "fácil", "rápido", "eficiente", "intuitivo".
-
-====================================================
-4. EXEMPLO DE REATORAÇÃO PARA ATOMICIADADE MÁXIMA
-====================================================
-❌ ERRADO:
-Como cliente,
-quero escolher entre receber a roupa em casa ou retirar no brechó,
-para que eu possa finalizar a transação e adquirir os itens.
-
-✅ CORRETO (Sem nenhum 'e' / 'ou' no corpo):
-Como cliente,
-quero selecionar a modalidade de envio do pedido,
-para que eu possa definir a forma de recebimento da compra.
-
-====================================================
-FORMATO DE SAÍDA ESPERADO
-====================================================
-US-01
-Como <ator>,
-quero <ação estritamente sem as palavras 'e' e 'ou'>,
-para que <benefício estritamente sem as palavras 'e' e 'ou'>.
+US-[NÚMERO] - [NOME ESPECÍFICO DA FUNCIONALIDADE]
+Como <Persona/Ator>,
+quero <Ação Única e Concreta com contexto do negócio>,
+para que <Benefício Direto e Métrica/Impacto do negócio>.
 
 Critérios de Aceitação:
-1. <Validação da ação>
-2. <Regra de negócio ou tratamento de erro>
-
-(Repita para todas as User Stories VÁLIDAS do escopo)
+- CA : [Detalhamento concreto da regra, campo, validação ou comportamento] (Origem: Trecho X)
+[Adicione quantas linhas de CA forem necessárias para cobrir todos os cenários da história]
 """),
-
-        HumanMessage(content=f"""
-Contexto Estruturado:
--------------------------
-{structured_context}
--------------------------
-
-Gere o backlog aplicando o filtro de escopo rigoroso e a proibição de conectivos no 'quero' e 'para que' para garantir 100% de aprovação no QUS (7/7), INVEST (6/6) e na validação semântica.
-""")
+        HumanMessage(content=f"Contexto do Documento de Escopo:\n{contexto_completo}")
     ]
-
     return get_response_from_openai(messages).content
 
 @tool
-def semantic_consistency_tool(user_stories: str, structured_context: str) -> str:
+def semantic_consistency_tool(payload: str) -> str:
     """
-    Validação semântica baseada em regras objetivas de Engenharia de Requisitos.
-    A ferramenta verifica aderência ao domínio, escopo e stakeholders,
-    apontando exatamente qual regra foi violada.
+    Auditoria semântica e verificação de aderência de escopo.
+    O 'payload' deve conter o texto completo do CONTEXTO e das HISTÓRIAS concatenados.
     """
-
     messages = [
         SystemMessage(content="""
-Você é um Auditor de Engenharia de Requisitos especializado em
-Validação Semântica de User Stories.
+Você é um Auditor Semântico de Requisitos.
+Sua função é verificar se CADA User Story PERTENCE ao escopo do projeto.
+Uma história pode ser perfeitamente escrita (QUS 7/7), mas ser REPROVADA SEMANTICAMENTE por não constar no escopo.
 
-Sua função NÃO é dar opinião.
-Sua função é aplicar rigorosamente as regras abaixo.
-
-====================================================
-REGRAS DE VALIDAÇÃO
-====================================================
-
-Para cada User Story execute exatamente estes passos.
-
-PASSO 1: Verifique se a funcionalidade existe no escopo.
-PASSO 2: Verifique se a User Story adiciona funcionalidades inexistentes.
-PASSO 3: Verifique se contradiz alguma restrição.
-PASSO 4: Verifique se o ator realmente pode executar aquela ação.
-PASSO 5: Verifique se os critérios de aceitação continuam dentro do escopo.
-
-====================================================
-REPROVE SOMENTE QUANDO
-====================================================
-
-1) A User Story introduzir uma funcionalidade que não aparece no escopo.
-2) Algum critério de aceitação contradizer uma restrição explícita.
-3) O ator da User Story não possuir responsabilidade compatível.
-4) A User Story alterar o objetivo principal do sistema.
-
-====================================================
-NÃO REPROVE QUANDO
-====================================================
-
-NÃO reprove apenas porque:
-- o critério é mais detalhado;
-- existe uma forma diferente de implementar;
-- existe uma decisão técnica;
-- existe uma melhoria de interface;
-- o texto está mais específico;
-
-DESDE QUE essas informações não contradigam o escopo.
-
-====================================================
-TEMPO REAL
-====================================================
-
-Considere "tempo real" uma violação SOMENTE quando:
-- exigir sincronização automática;
-- exigir atualização instantânea;
-- exigir notificações automáticas;
-- exigir push;
-- exigir WebSocket;
-
-Se a User Story apenas disser que as informações devem refletir as alterações
-realizadas posteriormente, NÃO considere violação.
-
-====================================================
-FORMATO DA RESPOSTA
-====================================================
-
-Para CADA User Story responda exatamente:
-
+Para cada User Story responda:
 US-XX
-
-Status:
-[APROVADO SEMANTICAMENTE]
-ou
-[REPROVADO SEMANTICAMENTE]
-
-Justificativa:
-- explique em poucas linhas.
-
-Caso reprove, informe obrigatoriamente:
-Trecho do Escopo Violado: "...copie exatamente o trecho..."
-Critério responsável: "...texto do critério..."
-
-Caso não exista violação, a User Story deve ser APROVADA.
+Status: [APROVADO SEMANTICAMENTE] ou [REPROVADO SEMANTICAMENTE]
+Justificativa: Explicar concisamente se a funcionalidade existe no documento de escopo.
 """),
-
-        HumanMessage(content=f"""
-CONTEXTO ESTRUTURADO
-
------------------------------------
-
-{structured_context}
-
------------------------------------
-
-USER STORIES
-
------------------------------------
-
-{user_stories}
-
------------------------------------
-
-Realize a auditoria completa.
-""")
+        HumanMessage(content=f"DADOS PARA ANÁLISE SEMÂNTICA:\n\n{payload}")
     ]
-
     return get_response_from_openai(messages).content
 
 @tool
-def requirements_coverage_tool(user_stories: str, structured_context: str) -> str:
+def requirements_coverage_tool(payload: str) -> str:
     """
-    Gera uma matriz de rastreabilidade entre os requisitos do escopo
-    e as User Stories geradas pelo agente.
+    Matriz de Rastreabilidade entre regras de escopo e User Stories.
+    O 'payload' deve conter o texto completo do CONTEXTO e das HISTÓRIAS concatenados.
     """
-
     messages = [
-        SystemMessage(content="""
-Você é especialista em rastreabilidade de requisitos.
-Retorne SOMENTE JSON válido.
-Não utilize markdown.
-Não utilize blocos de código.
-Não utilize tabelas.
-"""),
-
-        HumanMessage(content=f"""
-CONTEXTO
-
-{structured_context}
-
-USER STORIES
-
-{user_stories}
-
-Retorne exatamente neste formato:
-
-[
-    {{
-        "Regra":"Disponibilizar campus e sala",
-        "UserStory":"US-01",
-        "Observacao":"Relaciona-se diretamente..."
-    }}
-]
-""")
+        SystemMessage(content="Retorne SOMENTE um JSON válido com a matriz de rastreabilidade."),
+        HumanMessage(content=f"DADOS PARA RASTREABILIDADE:\n\n{payload}\n\nFormat: [{{\"Regra\":\"...\", \"UserStory\":\"US-XX\", \"Observacao\":\"...\"}}]")
     ]
-
     return get_response_from_openai(messages).content
 
 @tool
 def quality_assessment_tool(user_stories: str) -> str:
     """
-    Avalia a qualidade das User Stories geradas usando as 7 dimensões binárias do QUS.
+    Avaliação estritamente estrutural/sintática no framework QUS (7 dimensões).
     """
     messages = [
-        SystemMessage(content="""Você é um auditor rigoroso de qualidade de requisitos especialista no framework QUS (Quality of User Stories).
-Sua avaliação é estritamente binária (1 para atende, 0 para não atende) para cada uma das 7 dimensões:
+        SystemMessage(content="""Você é um auditor do framework QUS (Quality of User Stories).
+Avalie cada história em 7 critérios binários (1/0):
+1. Bem-formada (Well-formed)
+2. Atômica (Atomic)
+3. Conceitualmente Sólida (Conceptually Sound)
+4. Inambígua (Unambiguous)
+5. Mínima (Minimal)
+6. Sentença Completa (Full Sentence)
+7. Estimável (Estimable)
 
-1. Bem-formada (Well-formed): A história segue estritamente a fôrma gramatical clássica "Como [Ator], quero [Ação], para que [Benefício]"?
-2. Atômica (Atomic): O TEXTO DA HISTÓRIA (campos 'quero' e 'para que') descreve apenas UMA ação e UM benefício?
-   - PENALIZE se houver o conectivo 'e' no 'quero' ou no 'para que' unindo duas funcionalidades ou benefícios distintos (ex: "fazer X e Y").
-   - NOTA DE EXCEÇÃO: O uso da palavra 'e' dentro dos CRITÉRIOS DE ACEITAÇÃO É TOTALMENTE PERMITIDO e NÃO DEVE SER PENALIZADO, desde que sirva apenas para detalhar validações da mesma funcionalidade.
-3. Conceitualmente Sólida (Conceptually Sound): O benefício proposto ("para que...") justifica de forma lógica e coerente a ação solicitada pelo ator?
-4. Inambígua (Unambiguous): A redação é clara, direta e livre de termos subjetivos, vagos ou de dupla interpretação (ex: "fácil", "rápido", "eficiente", "claro", "acessível")?
-5. Mínima (Minimal): A história contém apenas os elementos essenciais (Ator, Ação, Benefício) sem detalhes técnicos prematuros de implementação (ex: nomes de tabelas do BD, frameworks ou rotas de API)?
-6. Sentença Completa (Full Sentence): A frase é gramaticalmente completa, com sujeito, verbo e complemento bem estruturados na língua em que foi escrita?
-7. Estimável (Estimable): O escopo descrito na história é claro o suficiente para que o time de desenvolvimento consiga mensurar o esforço sem precisar de reuniões adicionais de alinhamento?
-
-Para cada User Story, avalie as 7 dimensões (0 ou 1) e forneça a nota final inteira (de 0 a 7).
-Indique claramente qual critério falhou, se houver."""),
-        HumanMessage(content=f"""
-            Analise cada uma das User Stories sob as 7 dimensões binárias do QUS:
-            {user_stories}
-        """)
+SE A NOTA FOR MENOR QUE 7, VOCÊ É OBRIGADO A NOMEAR EXATAMENTE QUAIS CRITÉRIOS FALHARAM.
+Exemplo para nota 6/7: "Falha: Atômica". NUNCA omita a justificativa da perda de ponto."""),
+        HumanMessage(content=f"Avalie:\n{user_stories}")
     ]
     return get_response_from_openai(messages).content
 
 @tool
 def invest_assessment_tool(user_stories: str) -> str:
     """
-    Avalia o backlog de User Stories utilizando as 6 dimensões binárias do INVEST.
+    Avaliação de viabilidade ágil no acrônimo INVEST (6 dimensões).
     """
     messages = [
-        SystemMessage(content="""Você é um Agile Coach especialista no acrônimo INVEST.
-Sua avaliação é estritamente binária (1 para atende, 0 para não atende) para cada uma das 6 dimensões:
+        SystemMessage(content="""Você é um Agile Coach especialista em INVEST.
+Avalie cada história em 6 critérios binários (1/0):
+1. Independent
+2. Negotiable
+3. Valuable
+4. Estimable
+5. Small
+6. Testable
 
-1. I — Independent (Independente): A história pode ser desenvolvida e implantada em qualquer ordem sem ter dependência direta do término de outra história do backlog?
-2. N — Negotiable (Negociável): A história deixa espaço para o time de desenvolvimento negociar a solução técnica com o Product Owner, sem detalhar telas ou botões específicos?
-3. V — Valuable (Valiosa): A funcionalidade entrega um valor claro e perceptível para o usuário final ou para o negócio (comprovado no "para que...")?
-4. E — Estimable (Estimável): O tamanho e a complexidade da história são compreensíveis para o time de engenharia estimar os pontos de função ou story points?
-5. S — Small (Pequena): O escopo é reduzido o suficiente para ser desenvolvido e testado dentro de uma única Sprint (geralmente entre 1 a 2 semanas)?
-6. T — Testable (Testável): A história possui critérios de aceitação claros que permitem ao QA escrever testes automatizados ou manuais para aprovar a entrega?
-
-Analise cada User Story, some os pontos (0 a 6) e retorne apenas valores inteiros."""),
-        HumanMessage(content=f"""
-            Analise as seguintes User Stories sob as 6 dimensões binárias do INVEST:
-            {user_stories}
-        """)
+SE A NOTA FOR MENOR QUE 6, VOCÊ É OBRIGADO A NOMEAR EXATAMENTE QUAIS CRITÉRIOS FALHARAM.
+Exemplo para nota 5/6: "Falha: Small". NUNCA omita a justificativa da perda de ponto."""),
+        HumanMessage(content=f"Avalie:\n{user_stories}")
     ]
     return get_response_from_openai(messages).content
 
 # --- CONFIGURAÇÃO DO AGENTE E PROMPT ---
 toolkit = [
-    context_extraction_tool, 
-    user_story_generation_tool, 
+    rag_indexing_tool,
+    normative_analysis_tool,
+    user_story_rag_generation_tool,
     semantic_consistency_tool, 
     requirements_coverage_tool, 
     quality_assessment_tool, 
@@ -487,51 +324,55 @@ toolkit = [
 
 prompt = ChatPromptTemplate.from_messages([
     ("system", """
-Você é um Engenheiro de Software automatizado especialista em Engenharia de Requisitos Ágeis e Validação Avançada de Modelos.
-Seu fluxo de trabalho é estrito, ordenado e obrigatório:
-    1. Execute a 'context_extraction_tool' passando a URL enviada pelo usuário.
-    2. Envie o contexto gerado para a 'user_story_generation_tool'.
-    3. Envie as histórias geradas E o contexto estruturado da etapa 1 para a 'semantic_consistency_tool'.
-    4. Envie as histórias geradas E o contexto estruturado da etapa 1 para a 'requirements_coverage_tool'.
-    5. Envie as histórias geradas para a 'quality_assessment_tool'.
-    6. Envie as MESMAS histórias geradas para a 'invest_assessment_tool'.
-    
-IMPORTANTE: Utilize as tags delimitadoras [SECAO_...] exatamente como indicado abaixo para permitir a segmentação na interface gráfica:
+Você é um Engenheiro de Software automatizado especialista em Engenharia de Requisitos com suporte a RAG.
+Instruções estritas do fluxo com ancoragem e análise de lacunas:
+
+1. Execute 'rag_indexing_tool' enviando a URL informada para vetorizar o documento.
+2. Execute 'normative_analysis_tool' com a busca das principais regras e personas do projeto para gerar o relatório de lacunas.
+3. Execute 'user_story_rag_generation_tool' com base nas personas/módulos mapeados para gerar o backlog com rastreabilidade explícita aos trechos.
+4. Execute 'semantic_consistency_tool' concatenando o relatório de análise normativa e as histórias no parâmetro 'payload'.
+5. Execute 'requirements_coverage_tool' concatenando a análise normativa e as histórias no parâmetro 'payload'.
+6. Execute 'quality_assessment_tool' enviando as histórias geradas.
+7. Execute 'invest_assessment_tool' enviando as histórias geradas.
+
+Organize a saída utilizando estritamente as tags de seção e esquemas definidos abaixo:
+
+[SECAO_ANALISE_NORMATIVA]
+Exiba o resultado completo gerado pela ferramenta 'normative_analysis_tool', destacando lacunas e omissões encontradas.
 
 [SECAO_US]
-Apresente aqui o Backlog Completo das User Stories EXATAMENTE como foram retornadas pela 'user_story_generation_tool'. NÃO altere o texto e NÃO adicione conectivos "e" nem palavras vagas.
+Apresente o Backlog Completo das User Stories ancoradas com rastreabilidade de trechos gerado pela 'user_story_rag_generation_tool'.
 
 [SECAO_METRICAS]
-#### 1. Consolidação Quantitativa das Métricas
-- MÉTRICAS QUS: [SOMA_EXATA_DAS_NOTAS_QUS_DAS_HISTORIAS] / [QUANTIDADE_TOTAL_DE_HISTORIAS * 7]
-- MÉTRICAS INVEST: [SOMA_EXATA_DAS_NOTAS_INVEST_DAS_HISTORIAS] / [QUANTIDADE_TOTAL_DE_HISTORIAS * 6]
-- RASTREABILIDADE: [resumo do alinhamento com as regras de negócio]
+#### 1. Consolidação Quantitativa das Métricas Sintáticas e Estruturais
+- MÉTRICAS QUS: [SOMA_INTEIRA_NOTAS_QUS] / [TOTAL_HISTORIAS * 7]
+- MÉTRICAS INVEST: [SOMA_INTEIRA_NOTAS_INVEST] / [TOTAL_HISTORIAS * 6]
 
-REGRAS RÍGIDAS DE CÁLCULO E FORMATAÇÃO:
-1. Monte primeiro a Tabela do 'Relatório de Auditoria Simplificado'.
-2. Para calcular 'MÉTRICAS QUS':
-   - Leia a coluna 'Avaliação QUS (Total: 7)' de CADA linha da tabela criada.
-   - Somar EXATAMENTE os valores inteiros linha por linha (exemplo: US-01=7, US-02=6 -> 7+6=13...).
-   - O numerador OBRIGATORIAMENTE deve ser o resultado dessa soma linha por linha. NUNCA invente ou estime esse valor.
-   - O denominador é SEMPRE (Quantidade de US * 7). Exemplo com 8 histórias: 56.
-3. Repita o mesmo procedimento estrito para 'MÉTRICAS INVEST'.
+*Regras de Consolidação:*
+- O numerador DEVE ser a soma exata dos pontos obtidos por todas as histórias (exemplo: se forem 3 histórias com notas 6, 7 e 6, a soma é 19).
+- NÃO exiba divisão com casas decimais ou porcentagens na linha da consolidação. Use estritamente o formato `X / Y`.
 
-#### 2. Relatório de Auditoria Simplificado (Métricas Estruturais)
-Monte uma tabela Markdown comparativa consolidando os dados das ferramentas QUS e INVEST utilizando SOMENTE NOTAS NUMÉRICAS INTEIRAS com as colunas exatas:
-| ID da US | Funcionalidade Principal | Avaliação QUS (Total: 7) | Avaliação INVEST (Total: 6) | Critério com Falha detectado |
+#### 2. Relatório de Auditoria Estrutural (QUS e INVEST)
 
-#### 3. Diagnóstico Técnico dos Resultados
-Apresente uma justificativa analítica em tópicos explicando:
-- Por que a métrica QUS atingiu o resultado obtido.
-- Por que a métrica INVEST variou ou se comportou dessa forma.
-- Como o rastreamento ativo de cobertura de requisitos previne falhas de omissão de escopo comuns em geradores baseados em LLM.
+A tabela abaixo DEVE seguir este cabeçalho e formato padronizado de 1 linha por User Story (NÃO crie tabelas separadas por critérios individuais):
+
+| User Story | Nota QUS | Falhas QUS | Nota INVEST | Falhas INVEST |
+| :--- | :--- | :--- | :--- | :--- |
+| US-001 | 6/7 | Atômica | 6/6 | Nenhuma |
+| US-002 | 7/7 | Nenhuma | 6/6 | Nenhuma |
+
+*Instruções para preenchimento da Tabela:*
+- 'Nota QUS': Soma dos critérios QUS atendidos pela história sobre 7 (ex: 6/7).
+- 'Falhas QUS': Nome do critério QUS com nota 0 (ou 'Nenhuma' se nota for 7/7).
+- 'Nota INVEST': Soma dos critérios INVEST atendidos pela história sobre 6 (ex: 5/6).
+- 'Falhas INVEST': Nome do critério INVEST com nota 0 (ou 'Nenhuma' se nota for 6/6).
 
 [SECAO_AVALIADOR]
 #### 1. Relatório de Validação de Domínio e Nexo Semântico
-(Apresente a análise semântica detalhada da 'semantic_consistency_tool').
+Resultado da 'semantic_consistency_tool'.
 
 #### 2. Matriz de Cobertura de Requisitos
-(Apresente a Matriz de Rastreabilidade gerada pela 'requirements_coverage_tool').
+Resultado da 'requirements_coverage_tool'.
 """),
     ("human", "{input}"),
     MessagesPlaceholder(variable_name="agent_scratchpad"),
@@ -549,7 +390,7 @@ st.markdown("---")
 url_padrao = "https://docs.google.com/document/d/e/2PACX-1vTwj4Yh9UVPzqEpHJMprp875O7bW6XRQek_JNl-1ZxriLWvXvWInIxlxaYY4-yTRRTvxNIvUSPkuFbm/pub"
 url_documento = st.text_input("Cole aqui a URL pública do documento de escopo (Google Docs publicado na Web ou site):", value=url_padrao)
 
-if st.button("🚀 Iniciar Pipeline de IA", use_container_width=True):
+if st.button(" Iniciar Pipeline de IA", use_container_width=True):
     tracemalloc.start()
     tempo_inicial = time.time()
     
@@ -570,71 +411,70 @@ if st.button("🚀 Iniciar Pipeline de IA", use_container_width=True):
                 
                 st.success("Processamento Concluído com Sucesso!")
                 
-                # --- PARSER DA RESPOSTA EM SEÇÕES ---
                 output_total = result["output"]
                 
-                partes_us = output_total.split("[SECAO_US]")
-                partes_metricas = output_total.split("[SECAO_METRICAS]")
-                partes_avaliador = output_total.split("[SECAO_AVALIADOR]")
+                conteudo_us = ""
+                conteudo_metricas = ""
+                conteudo_avaliador = ""
+                conteudo_normativa = ""
                 
-                conteudo_us = partes_us[1].split("[SECAO_")[0] if len(partes_us) > 1 else output_total
-                conteudo_metricas = partes_metricas[1].split("[SECAO_")[0] if len(partes_metricas) > 1 else ""
-                conteudo_avaliador = partes_avaliador[1].split("[SECAO_")[0] if len(partes_avaliador) > 1 else ""
+                if "[SECAO_ANALISE_NORMATIVA]" in output_total:
+                    p_norm = output_total.split("[SECAO_ANALISE_NORMATIVA]")[1]
+                    conteudo_normativa = p_norm.split("[SECAO_US]")[0] if "[SECAO_US]" in p_norm else p_norm
 
-                # --- CORREÇÃO MATEMÁTICA AUTOMÁTICA EM PYTHON ---
+                if "[SECAO_US]" in output_total:
+                    p_us = output_total.split("[SECAO_US]")[1]
+                    conteudo_us = p_us.split("[SECAO_METRICAS]")[0] if "[SECAO_METRICAS]" in p_us else p_us
+                
+                if "[SECAO_METRICAS]" in output_total:
+                    p_met = output_total.split("[SECAO_METRICAS]")[1]
+                    conteudo_metricas = p_met.split("[SECAO_AVALIADOR]")[0] if "[SECAO_AVALIADOR]" in p_met else p_met
+                
+                if "[SECAO_AVALIADOR]" in output_total:
+                    conteudo_avaliador = output_total.split("[SECAO_AVALIADOR]")[1]
+
                 if conteudo_metricas:
                     conteudo_metricas = recalcular_metricas_markdown(conteudo_metricas)
 
-                # --- EXIBIÇÃO ORGANIZADA EM ABAS ---
-                tab1, tab2, tab3, tab4 = st.tabs([
-                    " Backlog de User Stories", 
+                tab0, tab1, tab2, tab3, tab4 = st.tabs([
+                    " Análise Normativa & Lacunas",
+                    " Backlog Ancorado (RAG)", 
                     " Métricas de Qualidade (QUS/INVEST)", 
                     " Validação Semântica & Cobertura", 
                     " Desempenho & Recursos"
                 ])
                 
+                with tab0:
+                    st.header(" Análise Normativa e Detecção de Omissões no Documento")
+                    st.markdown(conteudo_normativa.strip())
                 with tab1:
                     st.header(" Backlog de User Stories Gerado")
-                    st.markdown(conteudo_us)
+                    st.markdown(conteudo_us.strip())
                     
                 with tab2:
-                    st.header("Métricas e Auditoria Qualitativa")
-                    st.markdown(conteudo_metricas)
+                    st.header(" Métricas e Auditoria Qualitativa (Estrutura e Sintaxe)")
+                    st.markdown(conteudo_metricas.strip())
                     
                 with tab3:
-                    st.header("🔍 Relatório do Avaliador")
-
+                    st.header(" Relatório do Avaliador (Aderência de Escopo e Semântica)")
                     st.markdown(
                         """
                         <style>
-                        section[data-testid="stMarkdownContainer"] table {
-                            width: 100%;
-                        }
-
-                        section[data-testid="stMarkdownContainer"] th {
-                            background-color: #1E293B;
-                            color: white;
-                            text-align: center;
-                        }
-
-                        section[data-testid="stMarkdownContainer"] td {
-                            vertical-align: top;
-                            white-space: pre-wrap;
-                        }
+                        section[data-testid="stMarkdownContainer"] table { width: 100%; }
+                        section[data-testid="stMarkdownContainer"] th { background-color: #1E293B; color: white; text-align: center; }
+                        section[data-testid="stMarkdownContainer"] td { vertical-align: top; white-space: pre-wrap; }
                         </style>
                         """,
                         unsafe_allow_html=True,
                     )
-
-                    st.markdown(conteudo_avaliador)
+                    st.markdown(conteudo_avaliador.strip())
                     
                 with tab4:
                     st.header("⚡ Desempenho Técnico do Pipeline")
-                    
                     col1, col2, col3 = st.columns(3)
                     
                     with col1:
-                        st.metric(label=" Tempo Total de Execução", value=f"{tempo_final - tempo_inicial:.2f} s")
+                        st.metric(label="⏱ Tempo Total de Execução", value=f"{tempo_final - tempo_inicial:.2f} s")
                         st.metric(label=" Consumo de Memória de Pico", value=f"{memoria_pico / (1024 * 1024):.2f} MB")
                     
                     with col2:

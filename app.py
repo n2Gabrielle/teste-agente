@@ -30,7 +30,7 @@ VECTOR_STORE = None
 # Configuração da página do Streamlit
 st.set_page_config(
     page_title="Sandbox de Engenharia de Requisitos Ágeis - UFF",
-    page_icon="",
+    page_icon="🎓",
     layout="wide"
 )
 
@@ -49,12 +49,13 @@ if not api_key:
         pass
 
 if not api_key:
-    st.error(" Chave da OpenAI não configurada. Adicione nos Secrets do Streamlit Cloud ou no arquivo .env local.")
+    st.error("Chave da OpenAI não configurada. Adicione nos Secrets do Streamlit Cloud ou no arquivo .env local.")
     st.stop()
 
 os.environ["OPENAI_API_KEY"] = api_key
 
-llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, openai_api_key=api_key)
+# Ajustado max_tokens para permitir respostas longas do modelo
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, openai_api_key=api_key, max_tokens=8012)
 
 def get_response_from_openai(messages):
     return llm.invoke(messages)
@@ -94,7 +95,6 @@ def recalcular_metricas_markdown(texto_metricas: str) -> str:
     notas_invest = []
     
     for linha in linhas:
-        # Regex flexível para capturar variações de identificadores das USs
         if "|" in linha and re.search(r'US-?\d+', linha, re.IGNORECASE):
             colunas = [c.strip() for c in linha.split('|')]
             if colunas and colunas[0] == '':
@@ -142,10 +142,10 @@ def rag_indexing_tool(url: str) -> str:
     if raw_text.startswith("Erro") or raw_text.startswith("Aviso"):
         return raw_text
 
-    # Fragmentação adaptativa
+    # Fragmentação adaptativa otimizada
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=600,
-        chunk_overlap=100,
+        chunk_size=500,
+        chunk_overlap=120,
         separators=["\n\n", "\n", ".", ";", " "]
     )
     docs = text_splitter.create_documents([raw_text])
@@ -166,25 +166,27 @@ def normative_analysis_tool(query_escopo: str) -> str:
     if not VECTOR_STORE:
         return "Erro: Base vetorial não inicializada. Execute rag_indexing_tool primeiro."
 
-    # Recuperação dos trechos mais relevantes do escopo
-    docs_relevantes = VECTOR_STORE.similarity_search(query_escopo, k=6)
+    docs_relevantes = VECTOR_STORE.similarity_search(query_escopo, k=20)
     contexto_recuperado = "\n---\n".join([d.page_content for d in docs_relevantes])
 
     messages = [
         SystemMessage(content="""
 Você é um Engenheiro de Requisitos especialista em Análise Normativa e Auditoria Primária.
 Examine o texto recuperado do documento de escopo e identifique:
-1. REGRAS OMISSAS OU INCOMPLETAS (Ex: regras de validação ausentes, fluxos alternativos não descritos).
-2. DUVIDAS / LACUNAS que precisam de confirmação do analista.
-3. CONTRADIÇÕES internas.
+1. MAPEAMENTO DE MÓDULOS E REQUISITOS (Liste todos os módulos, APIs, telas, chatbots ou fases citadas).
+2. REGRAS OMISSAS OU INCOMPLETAS (Ex: regras de validação ausentes, fluxos alternativos não descritos).
+3. DÚVIDAS / LACUNAS que precisam de confirmação do analista.
+4. CONTRADIÇÕES internas.
 
 Formato da resposta:
 # ANÁLISE NORMATIVA E DIAGNÓSTICO DE LACUNAS
-## 1. REGRAS IDENTIFICADAS E VALIDADAS
+## 1. MÓDULOS E ESCOPO MAPEADOS
+- [Módulo/Componente X]: [Resumo das funcionalidades esperadas]
+## 2. REGRAS IDENTIFICADAS E VALIDADAS
 - [Regras confirmadas no texto]
-## 2. LACUNAS E OMISSÕES DETECTADAS
+## 3. LACUNAS E OMISSÕES DETECTADAS
 - [Ponto Omisso]: [Explicação da ausência e impacto na regra de negócio]
-## 3. PERGUNTAS DE REFINAMENTO SUGERIDAS
+## 4. PERGUNTAS DE REFINAMENTO SUGERIDAS
 - [Pergunta objetiva para o Analista/PO sanar a lacuna]
 """),
         HumanMessage(content=f"Contexto Recuperado via RAG:\n{contexto_recuperado}")
@@ -201,26 +203,34 @@ def user_story_rag_generation_tool(payload_contexto: str) -> str:
     if not VECTOR_STORE:
         return "Erro: Base vetorial não inicializada."
 
-    # Busca abrangente para recuperar todos os módulos e regras de negócio
     docs_relevantes = VECTOR_STORE.similarity_search(
-        "Módulos, funcionalidades, regras de negócio, personas e integrações", 
-        k=15
+        "Módulos, funcionalidades, APIs, Chatbot, Heliasta, Sistema Jurídico Web, regras de negócio e estimativas do projeto", 
+        k=25
     )
     contexto_completo = "\n---\n".join([f"[Trecho {i+1}]: {d.page_content}" for i, d in enumerate(docs_relevantes)])
 
-    messages = [
-    SystemMessage(content="""
+    prompt_mapeamento = [
+        SystemMessage(content="Com base no contexto fornecido, liste TODOS os módulos, APIs, telas e componentes funcionais individualmente que necessitam de User Stories. Seja exaustivo e liste todos sem exceção."),
+        HumanMessage(content=contexto_completo)
+    ]
+    mapa_funcionalidades = get_response_from_openai(prompt_mapeamento).content
+
+    prompt_geracao = [
+        SystemMessage(content="""
 Você é um Engenheiro de Requisitos Sênior especializado em detalhamento fino de software industrial.
-Sua missão é gerar um Backlog de Histórias de Usuário extremamente ESPECÍFICO, DETALHADO e com CRITÉRIOS DE ACEITAÇÃO RICOS baseados no contexto fornecido.
+Sua missão é gerar um Backlog de Histórias de Usuário EXAUSTIVO e COMPLETO cobrindo TODOS os módulos identificados no escopo.
+
+EXIGÊNCIAS DE COBERTURA:
+- Você DEVE gerar User Stories para TODOS os módulos e componentes mapeados no documento sem omissões.
+- Crie quantas histórias (US-001, US-002, ..., US-N) forem necessárias para cobrir 100% do escopo.
 
 EVITE GENERALISMOS:
-- PROIBIDO criar critérios de aceitação genéricos do tipo "O sistema deve permitir X".
-- CADA História de Usuário DEVE possuir de 2 a 4 Critérios de Aceitação (CA) detalhados contendo:
+- CADA História de Usuário DEVE possuir  Critérios de Aceitação (CA) detalhados que cubram o escopo contendo, por exemplo:
   1. Campos obrigatórios/opcionais envolvidos.
   2. Regras de validação, bloqueios ou pré-condições.
   3. Formatos esperados ou comportamentos do sistema em caso de sucesso/erro.
 
-FORMATO OBRIGATÓRIO:
+FORMATO OBRIGATÓRIO PARA CADA HISTÓRIA:
 
 US-[NÚMERO] - [NOME ESPECÍFICO DA FUNCIONALIDADE]
 Como <Persona/Ator>,
@@ -228,10 +238,35 @@ quero <Ação Única e Concreta com contexto do negócio>,
 para que <Benefício Direto e Métrica/Impacto do negócio>.
 
 Critérios de Aceitação:
-- CA : [Detalhamento concreto da regra, campo, validação ou comportamento] (Origem: Trecho X)
-[Adicione quantas linhas de CA forem necessárias para cobrir todos os cenários da história]
+- CA1: [Detalhamento concreto da regra, campo, validação ou comportamento] (Origem: Trecho X)
+- CA2: [Detalhamento concreto da regra, campo, validação ou comportamento] (Origem: Trecho Y)
 """),
-        HumanMessage(content=f"Contexto do Documento de Escopo:\n{contexto_completo}")
+        HumanMessage(content=f"MAPEAMENTO DE MÓDULOS OBRIGATÓRIOS:\n{mapa_funcionalidades}\n\nCONTEXTO DO DOCUMENTO DE ESCOPO:\n{contexto_completo}\n\nORIENTAÇÃO ADICIONAL: {payload_contexto}")
+    ]
+    return get_response_from_openai(prompt_geracao).content
+
+@tool
+def gap_coverage_verification_tool(payload: str) -> str:
+    """
+    Compara a Análise Normativa (escopo total do documento) com as User Stories JÁ GERADAS.
+    Identifica seções, APIs, regras de infraestrutura ou módulos do documento que NÃO possuem histórias associadas.
+    Retorna a lista exata do delta (requisitos faltantes) ou 'COBERTURA_TOTAL_CONFIRMADA'.
+    """
+    messages = [
+        SystemMessage(content="""
+Você é um Auditor Especialista em Rastreabilidade de Requisitos.
+Sua missão é comparar o escopo total extraído do documento com o backlog de User Stories gerado até agora.
+
+Analise atentamente se ficaram de fora:
+1. APIs descritas no Roadmap (ex: Criar Caso Não Processual, Agendamentos).
+2. Funcionalidades de Infraestrutura/Governança (ex: limitação de tokens LLM, modelos padrão de petição).
+3. Recursos de Interface/Sistemas Legados (ex: Login Automático/SSO, visualização de filas no Heliasta).
+
+REGRAS DE RESPOSTA:
+- Se houver requisitos/módulos do documento SEM histórias de usuário criadas, liste expressamente cada um deles com detalhes do que deve ser gerado.
+- Se 100% dos requisitos do documento estiverem cobertos por histórias, responda ÚNICA e EXCLUSIVAMENTE a frase: "COBERTURA_TOTAL_CONFIRMADA".
+"""),
+        HumanMessage(content=f"DADOS PARA AUDITORIA DE LACUNAS:\n\n{payload}")
     ]
     return get_response_from_openai(messages).content
 
@@ -263,7 +298,7 @@ def requirements_coverage_tool(payload: str) -> str:
     O 'payload' deve conter o texto completo do CONTEXTO e das HISTÓRIAS concatenados.
     """
     messages = [
-        SystemMessage(content="Retorne SOMENTE um JSON válido com a matriz de rastreabilidade."),
+        SystemMessage(content="Retorne SOMENTE um JSON válido com a matriz de rastreabilidade entre todas as regras do escopo e as User Stories geradas."),
         HumanMessage(content=f"DADOS PARA RASTREABILIDADE:\n\n{payload}\n\nFormat: [{{\"Regra\":\"...\", \"UserStory\":\"US-XX\", \"Observacao\":\"...\"}}]")
     ]
     return get_response_from_openai(messages).content
@@ -312,10 +347,12 @@ Exemplo para nota 5/6: "Falha: Small". NUNCA omita a justificativa da perda de p
     return get_response_from_openai(messages).content
 
 # --- CONFIGURAÇÃO DO AGENTE E PROMPT ---
+# CORREÇÃO: Adicionado 'gap_coverage_verification_tool' à lista de ferramentas
 toolkit = [
     rag_indexing_tool,
     normative_analysis_tool,
     user_story_rag_generation_tool,
+    gap_coverage_verification_tool,
     semantic_consistency_tool, 
     requirements_coverage_tool, 
     quality_assessment_tool, 
@@ -328,20 +365,25 @@ Você é um Engenheiro de Software automatizado especialista em Engenharia de Re
 Instruções estritas do fluxo com ancoragem e análise de lacunas:
 
 1. Execute 'rag_indexing_tool' enviando a URL informada para vetorizar o documento.
-2. Execute 'normative_analysis_tool' com a busca das principais regras e personas do projeto para gerar o relatório de lacunas.
-3. Execute 'user_story_rag_generation_tool' com base nas personas/módulos mapeados para gerar o backlog com rastreabilidade explícita aos trechos.
-4. Execute 'semantic_consistency_tool' concatenando o relatório de análise normativa e as histórias no parâmetro 'payload'.
-5. Execute 'requirements_coverage_tool' concatenando a análise normativa e as histórias no parâmetro 'payload'.
-6. Execute 'quality_assessment_tool' enviando as histórias geradas.
-7. Execute 'invest_assessment_tool' enviando as histórias geradas.
+2. Execute 'normative_analysis_tool' com a busca das principais regras, módulos e personas do projeto para gerar o relatório de lacunas.
+3. Execute 'user_story_rag_generation_tool' para gerar o backlog COMPLETO cobrindo TODOS os módulos mapeados na análise normativa.
+4. PASSO DE GARANTIA DE COBERTURA 100%:
+   - Execute 'gap_coverage_verification_tool' enviando a Análise Normativa e as User Stories geradas no Passo 3.
+   - SE o retorno for 'COBERTURA_TOTAL_CONFIRMADA', avance para o Passo 5.
+   - SE a ferramenta listar requisitos/módulos FALTANTES, execute novamente 'user_story_rag_generation_tool' passando a lista de pendências para gerar histórias adicionais.
+   - Concatene todas as histórias geradas no backlog final.
+5. Execute 'semantic_consistency_tool' concatenando a análise normativa e TODAS as histórias geradas.
+6. Execute 'requirements_coverage_tool' concatenando a análise normativa e TODAS as histórias geradas.
+7. Execute 'quality_assessment_tool' enviando a totalidade das histórias geradas.
+8. Execute 'invest_assessment_tool' enviando a totalidade das histórias geradas.
 
 Organize a saída utilizando estritamente as tags de seção e esquemas definidos abaixo:
 
 [SECAO_ANALISE_NORMATIVA]
-Exiba o resultado completo gerado pela ferramenta 'normative_analysis_tool', destacando lacunas e omissões encontradas.
+Exiba o resultado completo gerado pela ferramenta 'normative_analysis_tool', destacando módulos, lacunas e omissões encontradas.
 
 [SECAO_US]
-Apresente o Backlog Completo das User Stories ancoradas com rastreabilidade de trechos gerado pela 'user_story_rag_generation_tool'.
+Apresente o Backlog Completo das User Stories geradas para TODOS os módulos do documento pela 'user_story_rag_generation_tool'.
 
 [SECAO_METRICAS]
 #### 1. Consolidação Quantitativa das Métricas Sintáticas e Estruturais
@@ -379,7 +421,7 @@ Resultado da 'requirements_coverage_tool'.
 ])
 
 agent = create_openai_tools_agent(llm, toolkit, prompt)
-agent_executor = AgentExecutor(agent=agent, tools=toolkit, verbose=False)
+agent_executor = AgentExecutor(agent=agent, tools=toolkit, verbose=False, max_iterations=15)
 
 # --- INTERFACE DO STREAMLIT ---
 
@@ -390,11 +432,11 @@ st.markdown("---")
 url_padrao = "https://docs.google.com/document/d/e/2PACX-1vTwj4Yh9UVPzqEpHJMprp875O7bW6XRQek_JNl-1ZxriLWvXvWInIxlxaYY4-yTRRTvxNIvUSPkuFbm/pub"
 url_documento = st.text_input("Cole aqui a URL pública do documento de escopo (Google Docs publicado na Web ou site):", value=url_padrao)
 
-if st.button(" Iniciar Pipeline de IA", use_container_width=True):
+if st.button("🚀 Iniciar Pipeline de IA", use_container_width=True):
     tracemalloc.start()
     tempo_inicial = time.time()
     
-    with st.spinner("O Agente está processando o documento, gerando o backlog e aplicando a auditoria... Aguarde."):
+    with st.spinner("O Agente está processando o documento, mapeando todos os módulos e gerando o backlog completo... Aguarde."):
         with get_openai_callback() as cb:
             try:
                 result = agent_executor.invoke({
@@ -437,26 +479,26 @@ if st.button(" Iniciar Pipeline de IA", use_container_width=True):
                     conteudo_metricas = recalcular_metricas_markdown(conteudo_metricas)
 
                 tab0, tab1, tab2, tab3, tab4 = st.tabs([
-                    " Análise Normativa & Lacunas",
-                    " Backlog Ancorado (RAG)", 
-                    " Métricas de Qualidade (QUS/INVEST)", 
-                    " Validação Semântica & Cobertura", 
-                    " Desempenho & Recursos"
+                    "📋 Análise Normativa & Lacunas",
+                    "📌 Backlog Ancorado (RAG)", 
+                    "📊 Métricas de Qualidade (QUS/INVEST)", 
+                    "🔍 Validação Semântica & Cobertura", 
+                    "⚡ Desempenho & Recursos"
                 ])
                 
                 with tab0:
-                    st.header(" Análise Normativa e Detecção de Omissões no Documento")
+                    st.header("📋 Análise Normativa e Detecção de Omissões no Documento")
                     st.markdown(conteudo_normativa.strip())
                 with tab1:
-                    st.header(" Backlog de User Stories Gerado")
+                    st.header("📌 Backlog de User Stories Gerado")
                     st.markdown(conteudo_us.strip())
                     
                 with tab2:
-                    st.header(" Métricas e Auditoria Qualitativa (Estrutura e Sintaxe)")
+                    st.header("📊 Métricas e Auditoria Qualitativa (Estrutura e Sintaxe)")
                     st.markdown(conteudo_metricas.strip())
                     
                 with tab3:
-                    st.header(" Relatório do Avaliador (Aderência de Escopo e Semântica)")
+                    st.header("🔍 Relatório do Avaliador (Aderência de Escopo e Semântica)")
                     st.markdown(
                         """
                         <style>
@@ -475,15 +517,15 @@ if st.button(" Iniciar Pipeline de IA", use_container_width=True):
                     
                     with col1:
                         st.metric(label="⏱ Tempo Total de Execução", value=f"{tempo_final - tempo_inicial:.2f} s")
-                        st.metric(label=" Consumo de Memória de Pico", value=f"{memoria_pico / (1024 * 1024):.2f} MB")
+                        st.metric(label="💾 Consumo de Memória de Pico", value=f"{memoria_pico / (1024 * 1024):.2f} MB")
                     
                     with col2:
-                        st.metric(label=" Tokens de Entrada (Prompt)", value=f"{cb.prompt_tokens}")
-                        st.metric(label=" Tokens de Saída (Completion)", value=f"{cb.completion_tokens}")
+                        st.metric(label="📥 Tokens de Entrada (Prompt)", value=f"{cb.prompt_tokens}")
+                        st.metric(label="📤 Tokens de Saída (Completion)", value=f"{cb.completion_tokens}")
                     
                     with col3:
-                        st.metric(label=" Total de Tokens", value=f"{cb.total_tokens}")
-                        st.metric(label=" Custo Real (gpt-4o-mini)", value=f"${custo_real_calculado:.5f} USD")
+                        st.metric(label="🔢 Total de Tokens", value=f"{cb.total_tokens}")
+                        st.metric(label="💵 Custo Real (gpt-4o-mini)", value=f"${custo_real_calculado:.5f} USD")
                         
             except Exception as e:
                 st.error(f"Ocorreu um erro durante a execução do agente: {e}")

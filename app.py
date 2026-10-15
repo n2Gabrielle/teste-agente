@@ -54,8 +54,36 @@ if not api_key:
 
 os.environ["OPENAI_API_KEY"] = api_key
 
+# ---------------------------------------------------------
+# EDITOR DE TEMPERATURA (barra lateral)
+# ---------------------------------------------------------
+TEMPERATURA_PADRAO = 0.0
+
+if "temperatura" not in st.session_state:
+    st.session_state["temperatura"] = TEMPERATURA_PADRAO
+
+def restaurar_temperatura():
+    st.session_state["temperatura"] = TEMPERATURA_PADRAO
+
+with st.sidebar:
+    st.header("⚙️ Configurações do Modelo")
+    temperatura = st.slider(
+        "🌡️ Temperatura da IA",
+        min_value=0.0,
+        max_value=2.0,
+        step=0.1,
+        key="temperatura",
+        help="Valores baixos geram respostas mais determinísticas; valores altos, mais criativas e variadas.",
+    )
+    st.button("↺ Restaurar padrão", on_click=restaurar_temperatura, use_container_width=True)
+
+    if temperatura > 1.0:
+        st.warning("Temperaturas acima de 1.0 podem quebrar o formato das seções e da matriz JSON.")
+    else:
+        st.caption(f"Temperatura atual: **{temperatura:.1f}**")
+
 # Ajustado max_tokens para permitir respostas longas do modelo
-llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, openai_api_key=api_key, max_tokens=8012)
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=temperatura, openai_api_key=api_key, max_tokens=8012)
 
 def get_response_from_openai(messages):
     return llm.invoke(messages)
@@ -526,6 +554,7 @@ if st.button("🚀 Iniciar Pipeline de IA", use_container_width=True):
                     with col3:
                         st.metric(label="🔢 Total de Tokens", value=f"{cb.total_tokens}")
                         st.metric(label="💵 Custo Real (gpt-4o-mini)", value=f"${custo_real_calculado:.5f} USD")
+                        st.metric(label="🌡️ Temperatura Utilizada", value=f"{temperatura:.1f}")
                         
             except Exception as e:
                 st.error(f"Ocorreu um erro durante a execução do agente: {e}")

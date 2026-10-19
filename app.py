@@ -10,6 +10,7 @@ sys.path.append(diretorio_atual)
 import time
 import tracemalloc
 import re
+import json
 import requests
 from bs4 import BeautifulSoup
 import streamlit as st
@@ -27,6 +28,35 @@ from langchain_openai import OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 VECTOR_STORE = None
+
+# Resultados produzidos pelas ferramentas na execução atual.
+# As ferramentas de verificação/avaliação e a interface leem daqui, em vez de depender
+# do agente repassar (e muitas vezes resumir ou truncar) textos longos.
+RESULTADOS = {}
+
+def novo_estado_execucao():
+    RESULTADOS.clear()
+    RESULTADOS.update({
+        "analise_normativa": "",
+        "historias": [],
+        "lacunas": [],
+        "semantica": "",
+        "cobertura": "",
+        "qus": "",
+        "invest": "",
+    })
+
+novo_estado_execucao()
+
+def backlog_completo() -> str:
+    return "\n\n".join(RESULTADOS["historias"])
+
+def normalizar_id_us(texto: str) -> str:
+    return re.sub(r'US-?\s*(\d+)', lambda m: f"US-{int(m.group(1)):03d}", texto, flags=re.IGNORECASE)
+
+def ids_no_backlog() -> list:
+    ids = {normalizar_id_us(m) for m in re.findall(r'US-?\s*\d+', backlog_completo(), re.IGNORECASE)}
+    return sorted(ids, key=lambda s: int(s.split("-")[1]))
 
 # Configuração da página do Streamlit
 st.set_page_config(
@@ -117,47 +147,60 @@ def get_text_from_url(url: str) -> str:
         return f"Erro ao extrair conteúdo da URL ({url}): {str(e)}"
 
 
-def recalcular_metricas_markdown(texto_metricas: str) -> str:
-    linhas = texto_metricas.strip().split('\n')
-    
-    notas_qus = []
-    notas_invest = []
-    
-    for linha in linhas:
-        if "|" in linha and re.search(r'US-?\d+', linha, re.IGNORECASE):
-            colunas = [c.strip() for c in linha.split('|')]
-            if colunas and colunas[0] == '':
-                colunas.pop(0)
-            if colunas and colunas[-1] == '':
-                colunas.pop()
-                
-            if len(colunas) >= 4:
-                match_qus = re.search(r'(\d+)\s*/\s*7', colunas[1]) or re.search(r'(\d+)', colunas[1])
-                match_invest = re.search(r'(\d+)\s*/\s*6', colunas[3]) or re.search(r'(\d+)', colunas[3])
-                
-                if match_qus:
-                    notas_qus.append(int(match_qus.group(1)))
-                if match_invest:
-                    notas_invest.append(int(match_invest.group(1)))
+def extrair_notas(tabela: str, maximo: int) -> dict:
+    """Lê linhas '| US-001 | 6/7 | Atômica |' e devolve {US-001: (6, 'Atômica')}."""
+    notas = {}
+    padrao = re.compile(r'^\s*\|?\s*\**(US-?\s*\d+)\**\s*\|\s*(\d+)\s*/\s*%d\s*\|\s*([^|]*)' % maximo, re.IGNORECASE)
+    for linha in tabela.splitlines():
+        m = padrao.match(linha)
+        if m:
+            notas[normalizar_id_us(m.group(1))] = (int(m.group(2)), m.group(3).strip() or "Nenhuma")
+    return notas
 
-    if notas_qus and notas_invest:
-        total_qus = sum(notas_qus)
-        max_qus = len(notas_qus) * 7
-        total_invest = sum(notas_invest)
-        max_invest = len(notas_invest) * 6
-        
-        texto_metricas = re.sub(
-            r'- MÉTRICAS QUS:.*', 
-            f'- MÉTRICAS QUS: {total_qus} / {max_qus}', 
-            texto_metricas
+def montar_secao_metricas() -> str:
+    """Monta a consolidação e a tabela QUS/INVEST em Python a partir das saídas das ferramentas."""
+    qus = extrair_notas(RESULTADOS["qus"], 7)
+    invest = extrair_notas(RESULTADOS["invest"], 6)
+    ids = sorted(set(qus) | set(invest), key=lambda s: int(s.split("-")[1]))
+
+    if not ids:
+        return (
+            "⚠️ Não foi possível extrair as notas no formato de tabela. Saídas brutas das ferramentas:\n\n"
+            f"**QUS**\n\n{RESULTADOS['qus']}\n\n**INVEST**\n\n{RESULTADOS['invest']}"
         )
-        texto_metricas = re.sub(
-            r'- MÉTRICAS INVEST:.*', 
-            f'- MÉTRICAS INVEST: {total_invest} / {max_invest}', 
-            texto_metricas
+
+    total_qus = sum(nota for nota, _ in qus.values())
+    total_invest = sum(nota for nota, _ in invest.values())
+
+    linhas = [
+        "#### 1. Consolidação Quantitativa das Métricas Sintáticas e Estruturais",
+        f"- MÉTRICAS QUS: {total_qus} / {len(qus) * 7}",
+        f"- MÉTRICAS INVEST: {total_invest} / {len(invest) * 6}",
+    ]
+
+    no_backlog = ids_no_backlog()
+    nao_avaliadas = [i for i in no_backlog if i not in qus or i not in invest]
+    if nao_avaliadas:
+        linhas.append(
+            f"\n⚠️ {len(nao_avaliadas)} de {len(no_backlog)} histórias do backlog não receberam nota QUS e/ou INVEST: "
+            + ", ".join(nao_avaliadas)
         )
-        
-    return texto_metricas
+
+    linhas += [
+        "",
+        "#### 2. Relatório de Auditoria Estrutural (QUS e INVEST)",
+        "",
+        "| User Story | Nota QUS | Falhas QUS | Nota INVEST | Falhas INVEST |",
+        "| :--- | :--- | :--- | :--- | :--- |",
+    ]
+    for us in ids:
+        nota_q, falha_q = qus.get(us, (None, "-"))
+        nota_i, falha_i = invest.get(us, (None, "-"))
+        linhas.append(
+            f"| {us} | {f'{nota_q}/7' if nota_q is not None else '-'} | {falha_q} "
+            f"| {f'{nota_i}/6' if nota_i is not None else '-'} | {falha_i} |"
+        )
+    return "\n".join(linhas)
 
 # --- FERRAMENTAS DO AGENTE ---
 @tool
@@ -220,13 +263,17 @@ Formato da resposta:
 """),
         HumanMessage(content=f"Contexto Recuperado via RAG:\n{contexto_recuperado}")
     ]
-    return get_response_from_openai(messages).content
+    resposta = get_response_from_openai(messages).content
+    RESULTADOS["analise_normativa"] = resposta
+    return resposta
 
 @tool
 def user_story_rag_generation_tool(payload_contexto: str) -> str:
     """
-    Gera um Backlog de Histórias de Usuário exaustivo e atômico, 
+    Gera um Backlog de Histórias de Usuário exaustivo e atômico,
     garantindo cobertura completa de todos os módulos e regras do documento.
+    As histórias geradas são armazenadas automaticamente no backlog compartilhado.
+    Em uma segunda chamada, envie em 'payload_contexto' apenas a lista de pendências.
     """
     global VECTOR_STORE
     if not VECTOR_STORE:
@@ -237,6 +284,17 @@ def user_story_rag_generation_tool(payload_contexto: str) -> str:
         k=25
     )
     contexto_completo = "\n---\n".join([f"[Trecho {i+1}]: {d.page_content}" for i, d in enumerate(docs_relevantes)])
+
+    # Na rodada de complemento (após a verificação de lacunas), evita repetir histórias e IDs
+    instrucao_continuidade = ""
+    if RESULTADOS["historias"]:
+        existentes = ids_no_backlog()
+        proximo = int(existentes[-1].split("-")[1]) + 1 if existentes else 1
+        titulos = "\n".join(re.findall(r'US-?\s*\d+\s*-\s*[^\n*]+', backlog_completo(), re.IGNORECASE))
+        instrucao_continuidade = (
+            f"\n\nHISTÓRIAS JÁ EXISTENTES NO BACKLOG (NÃO repita):\n{titulos}\n\n"
+            f"Gere SOMENTE as histórias faltantes, numerando a partir de US-{proximo:03d}."
+        )
 
     prompt_mapeamento = [
         SystemMessage(content="Com base no contexto fornecido, liste TODOS os módulos, APIs, telas e componentes funcionais individualmente que necessitam de User Stories. Seja exaustivo e liste todos sem exceção."),
@@ -270,17 +328,32 @@ Critérios de Aceitação:
 - CA1: [Detalhamento concreto da regra, campo, validação ou comportamento] (Origem: Trecho X)
 - CA2: [Detalhamento concreto da regra, campo, validação ou comportamento] (Origem: Trecho Y)
 """),
-        HumanMessage(content=f"MAPEAMENTO DE MÓDULOS OBRIGATÓRIOS:\n{mapa_funcionalidades}\n\nCONTEXTO DO DOCUMENTO DE ESCOPO:\n{contexto_completo}\n\nORIENTAÇÃO ADICIONAL: {payload_contexto}")
+        HumanMessage(content=f"MAPEAMENTO DE MÓDULOS OBRIGATÓRIOS:\n{mapa_funcionalidades}\n\nCONTEXTO DO DOCUMENTO DE ESCOPO:\n{contexto_completo}\n\nORIENTAÇÃO ADICIONAL: {payload_contexto}{instrucao_continuidade}")
     ]
-    return get_response_from_openai(prompt_geracao).content
+    resposta = get_response_from_openai(prompt_geracao).content
+    RESULTADOS["historias"].append(resposta)
+
+    # O agente recebe só um resumo: o conteúdo completo fica no backlog compartilhado,
+    # evitando que ele precise copiar (ou resuma/trunque) as histórias nas próximas chamadas.
+    ids_gerados = sorted({normalizar_id_us(m) for m in re.findall(r'US-?\s*\d+', resposta, re.IGNORECASE)})
+    return (
+        f"Histórias geradas e armazenadas no backlog: {len(ids_gerados)} nesta chamada "
+        f"({', '.join(ids_gerados)}). Total no backlog: {len(ids_no_backlog())}. "
+        "As próximas ferramentas leem o backlog completo automaticamente."
+    )
 
 @tool
-def gap_coverage_verification_tool(payload: str) -> str:
+def gap_coverage_verification_tool(observacao: str = "") -> str:
     """
     Compara a Análise Normativa (escopo total do documento) com as User Stories JÁ GERADAS.
     Identifica seções, APIs, regras de infraestrutura ou módulos do documento que NÃO possuem histórias associadas.
     Retorna a lista exata do delta (requisitos faltantes) ou 'COBERTURA_TOTAL_CONFIRMADA'.
+    A análise normativa e o backlog completo são lidos automaticamente; NÃO copie o conteúdo no argumento.
     """
+    payload = (
+        f"ANÁLISE NORMATIVA (ESCOPO TOTAL):\n{RESULTADOS['analise_normativa']}\n\n"
+        f"BACKLOG DE USER STORIES GERADO ATÉ AGORA:\n{backlog_completo()}"
+    )
     messages = [
         SystemMessage(content="""
 Você é um Auditor Especialista em Rastreabilidade de Requisitos.
@@ -297,14 +370,23 @@ REGRAS DE RESPOSTA:
 """),
         HumanMessage(content=f"DADOS PARA AUDITORIA DE LACUNAS:\n\n{payload}")
     ]
-    return get_response_from_openai(messages).content
+    resposta = get_response_from_openai(messages).content
+    RESULTADOS["lacunas"].append(resposta)
+    return resposta
+
+def payload_contexto_e_historias() -> str:
+    return (
+        f"CONTEXTO (ANÁLISE NORMATIVA DO DOCUMENTO DE ESCOPO):\n{RESULTADOS['analise_normativa']}\n\n"
+        f"HISTÓRIAS DE USUÁRIO GERADAS:\n{backlog_completo()}"
+    )
 
 @tool
-def semantic_consistency_tool(payload: str) -> str:
+def semantic_consistency_tool(observacao: str = "") -> str:
     """
     Auditoria semântica e verificação de aderência de escopo.
-    O 'payload' deve conter o texto completo do CONTEXTO e das HISTÓRIAS concatenados.
+    O contexto e o backlog completo são lidos automaticamente; NÃO copie o conteúdo no argumento.
     """
+    payload = payload_contexto_e_historias()
     messages = [
         SystemMessage(content="""
 Você é um Auditor Semântico de Requisitos.
@@ -318,25 +400,40 @@ Justificativa: Explicar concisamente se a funcionalidade existe no documento de 
 """),
         HumanMessage(content=f"DADOS PARA ANÁLISE SEMÂNTICA:\n\n{payload}")
     ]
-    return get_response_from_openai(messages).content
+    resposta = get_response_from_openai(messages).content
+    RESULTADOS["semantica"] = resposta
+    return "Análise semântica concluída e armazenada para exibição."
 
 @tool
-def requirements_coverage_tool(payload: str) -> str:
+def requirements_coverage_tool(observacao: str = "") -> str:
     """
     Matriz de Rastreabilidade entre regras de escopo e User Stories.
-    O 'payload' deve conter o texto completo do CONTEXTO e das HISTÓRIAS concatenados.
+    O contexto e o backlog completo são lidos automaticamente; NÃO copie o conteúdo no argumento.
     """
+    payload = payload_contexto_e_historias()
     messages = [
         SystemMessage(content="Retorne SOMENTE um JSON válido com a matriz de rastreabilidade entre todas as regras do escopo e as User Stories geradas."),
         HumanMessage(content=f"DADOS PARA RASTREABILIDADE:\n\n{payload}\n\nFormat: [{{\"Regra\":\"...\", \"UserStory\":\"US-XX\", \"Observacao\":\"...\"}}]")
     ]
-    return get_response_from_openai(messages).content
+    resposta = get_response_from_openai(messages).content
+    RESULTADOS["cobertura"] = resposta
+    return "Matriz de rastreabilidade concluída e armazenada para exibição."
+
+FORMATO_TABELA_AVALIACAO = """
+
+FORMATO OBRIGATÓRIO DA RESPOSTA: somente uma tabela Markdown, uma linha por história, avaliando TODAS as histórias recebidas, sem texto antes ou depois:
+| User Story | Nota | Falhas |
+| :--- | :--- | :--- |
+| US-001 | {exemplo} | {falha_exemplo} |
+Use 'Nenhuma' na coluna Falhas quando a nota for máxima."""
 
 @tool
-def quality_assessment_tool(user_stories: str) -> str:
+def quality_assessment_tool(observacao: str = "") -> str:
     """
     Avaliação estritamente estrutural/sintática no framework QUS (7 dimensões).
+    O backlog completo é lido automaticamente; NÃO copie as histórias no argumento.
     """
+    user_stories = backlog_completo()
     messages = [
         SystemMessage(content="""Você é um auditor do framework QUS (Quality of User Stories).
 Avalie cada história em 7 critérios binários (1/0):
@@ -349,16 +446,20 @@ Avalie cada história em 7 critérios binários (1/0):
 7. Estimável (Estimable)
 
 SE A NOTA FOR MENOR QUE 7, VOCÊ É OBRIGADO A NOMEAR EXATAMENTE QUAIS CRITÉRIOS FALHARAM.
-Exemplo para nota 6/7: "Falha: Atômica". NUNCA omita a justificativa da perda de ponto."""),
+Exemplo para nota 6/7: "Falha: Atômica". NUNCA omita a justificativa da perda de ponto.""" + FORMATO_TABELA_AVALIACAO.format(exemplo="6/7", falha_exemplo="Atômica")),
         HumanMessage(content=f"Avalie:\n{user_stories}")
     ]
-    return get_response_from_openai(messages).content
+    resposta = get_response_from_openai(messages).content
+    RESULTADOS["qus"] = resposta
+    return f"Avaliação QUS concluída para {len(extrair_notas(resposta, 7))} de {len(ids_no_backlog())} histórias."
 
 @tool
-def invest_assessment_tool(user_stories: str) -> str:
+def invest_assessment_tool(observacao: str = "") -> str:
     """
     Avaliação de viabilidade ágil no acrônimo INVEST (6 dimensões).
+    O backlog completo é lido automaticamente; NÃO copie as histórias no argumento.
     """
+    user_stories = backlog_completo()
     messages = [
         SystemMessage(content="""Você é um Agile Coach especialista em INVEST.
 Avalie cada história em 6 critérios binários (1/0):
@@ -370,10 +471,12 @@ Avalie cada história em 6 critérios binários (1/0):
 6. Testable
 
 SE A NOTA FOR MENOR QUE 6, VOCÊ É OBRIGADO A NOMEAR EXATAMENTE QUAIS CRITÉRIOS FALHARAM.
-Exemplo para nota 5/6: "Falha: Small". NUNCA omita a justificativa da perda de ponto."""),
+Exemplo para nota 5/6: "Falha: Small". NUNCA omita a justificativa da perda de ponto.""" + FORMATO_TABELA_AVALIACAO.format(exemplo="5/6", falha_exemplo="Small")),
         HumanMessage(content=f"Avalie:\n{user_stories}")
     ]
-    return get_response_from_openai(messages).content
+    resposta = get_response_from_openai(messages).content
+    RESULTADOS["invest"] = resposta
+    return f"Avaliação INVEST concluída para {len(extrair_notas(resposta, 6))} de {len(ids_no_backlog())} histórias."
 
 # --- CONFIGURAÇÃO DO AGENTE E PROMPT ---
 # CORREÇÃO: Adicionado 'gap_coverage_verification_tool' à lista de ferramentas
@@ -391,59 +494,27 @@ toolkit = [
 prompt = ChatPromptTemplate.from_messages([
     ("system", """
 Você é um Engenheiro de Software automatizado especialista em Engenharia de Requisitos com suporte a RAG.
+
+IMPORTANTE: as ferramentas compartilham os resultados automaticamente. A análise normativa e TODAS as histórias
+geradas ficam armazenadas e são lidas diretamente pelas ferramentas de verificação e avaliação.
+NUNCA copie histórias, critérios de aceitação ou relatórios nos argumentos das ferramentas.
+
 Instruções estritas do fluxo com ancoragem e análise de lacunas:
 
 1. Execute 'rag_indexing_tool' enviando a URL informada para vetorizar o documento.
+   - SE retornar erro de acesso ao documento, PARE e informe o erro ao usuário.
 2. Execute 'normative_analysis_tool' com a busca das principais regras, módulos e personas do projeto para gerar o relatório de lacunas.
 3. Execute 'user_story_rag_generation_tool' para gerar o backlog COMPLETO cobrindo TODOS os módulos mapeados na análise normativa.
 4. PASSO DE GARANTIA DE COBERTURA 100%:
-   - Execute 'gap_coverage_verification_tool' enviando a Análise Normativa e as User Stories geradas no Passo 3.
+   - Execute 'gap_coverage_verification_tool'.
    - SE o retorno for 'COBERTURA_TOTAL_CONFIRMADA', avance para o Passo 5.
-   - SE a ferramenta listar requisitos/módulos FALTANTES, execute novamente 'user_story_rag_generation_tool' passando a lista de pendências para gerar histórias adicionais.
-   - Concatene todas as histórias geradas no backlog final.
-5. Execute 'semantic_consistency_tool' concatenando a análise normativa e TODAS as histórias geradas.
-6. Execute 'requirements_coverage_tool' concatenando a análise normativa e TODAS as histórias geradas.
-7. Execute 'quality_assessment_tool' enviando a totalidade das histórias geradas.
-8. Execute 'invest_assessment_tool' enviando a totalidade das histórias geradas.
+   - SE a ferramenta listar requisitos/módulos FALTANTES, execute novamente 'user_story_rag_generation_tool' passando em 'payload_contexto' somente a lista de pendências.
+   - Faça no máximo UMA rodada de complemento; depois avance para o Passo 5.
+5. Os passos a seguir são independentes: chame as quatro ferramentas JUNTAS, na mesma resposta:
+   'semantic_consistency_tool', 'requirements_coverage_tool', 'quality_assessment_tool' e 'invest_assessment_tool'.
 
-Organize a saída utilizando estritamente as tags de seção e esquemas definidos abaixo:
-
-[SECAO_ANALISE_NORMATIVA]
-Exiba o resultado completo gerado pela ferramenta 'normative_analysis_tool', destacando módulos, lacunas e omissões encontradas.
-
-[SECAO_US]
-Apresente o Backlog Completo das User Stories geradas para TODOS os módulos do documento pela 'user_story_rag_generation_tool'.
-
-[SECAO_METRICAS]
-#### 1. Consolidação Quantitativa das Métricas Sintáticas e Estruturais
-- MÉTRICAS QUS: [SOMA_INTEIRA_NOTAS_QUS] / [TOTAL_HISTORIAS * 7]
-- MÉTRICAS INVEST: [SOMA_INTEIRA_NOTAS_INVEST] / [TOTAL_HISTORIAS * 6]
-
-*Regras de Consolidação:*
-- O numerador DEVE ser a soma exata dos pontos obtidos por todas as histórias (exemplo: se forem 3 histórias com notas 6, 7 e 6, a soma é 19).
-- NÃO exiba divisão com casas decimais ou porcentagens na linha da consolidação. Use estritamente o formato `X / Y`.
-
-#### 2. Relatório de Auditoria Estrutural (QUS e INVEST)
-
-A tabela abaixo DEVE seguir este cabeçalho e formato padronizado de 1 linha por User Story (NÃO crie tabelas separadas por critérios individuais):
-
-| User Story | Nota QUS | Falhas QUS | Nota INVEST | Falhas INVEST |
-| :--- | :--- | :--- | :--- | :--- |
-| US-001 | 6/7 | Atômica | 6/6 | Nenhuma |
-| US-002 | 7/7 | Nenhuma | 6/6 | Nenhuma |
-
-*Instruções para preenchimento da Tabela:*
-- 'Nota QUS': Soma dos critérios QUS atendidos pela história sobre 7 (ex: 6/7).
-- 'Falhas QUS': Nome do critério QUS com nota 0 (ou 'Nenhuma' se nota for 7/7).
-- 'Nota INVEST': Soma dos critérios INVEST atendidos pela história sobre 6 (ex: 5/6).
-- 'Falhas INVEST': Nome do critério INVEST com nota 0 (ou 'Nenhuma' se nota for 6/6).
-
-[SECAO_AVALIADOR]
-#### 1. Relatório de Validação de Domínio e Nexo Semântico
-Resultado da 'semantic_consistency_tool'.
-
-#### 2. Matriz de Cobertura de Requisitos
-Resultado da 'requirements_coverage_tool'.
+Ao final, responda APENAS com um resumo curto (no máximo 3 linhas): quantas histórias foram geradas e se a cobertura total foi confirmada.
+NÃO reproduza histórias, tabelas ou relatórios na resposta final: a interface exibe os resultados das ferramentas diretamente.
 """),
     ("human", "{input}"),
     MessagesPlaceholder(variable_name="agent_scratchpad"),
@@ -535,6 +606,7 @@ if st.button("🚀 Iniciar Pipeline de IA", use_container_width=True):
     # Acompanhamento em tempo real: cada ferramenta chamada pelo agente aparece abaixo com entrada e saída
     st.markdown("#### 🛰️ Execução em tempo real")
     st_callback = PipelineProgressHandler(st.container())
+    novo_estado_execucao()
 
     with st.spinner("O Agente está processando o documento, mapeando todos os módulos e gerando o backlog completo... Aguarde."):
         with get_openai_callback() as cb:
@@ -554,32 +626,17 @@ if st.button("🚀 Iniciar Pipeline de IA", use_container_width=True):
                 custo_saida = (cb.completion_tokens / 1000000) * 0.60
                 custo_real_calculado = custo_entrada + custo_saida
                 
-                st.success("Processamento Concluído com Sucesso!")
-                
-                output_total = result["output"]
-                
-                conteudo_us = ""
-                conteudo_metricas = ""
-                conteudo_avaliador = ""
-                conteudo_normativa = ""
-                
-                if "[SECAO_ANALISE_NORMATIVA]" in output_total:
-                    p_norm = output_total.split("[SECAO_ANALISE_NORMATIVA]")[1]
-                    conteudo_normativa = p_norm.split("[SECAO_US]")[0] if "[SECAO_US]" in p_norm else p_norm
+                # Os conteúdos vêm direto das ferramentas (RESULTADOS), não da resposta final do agente
+                if not RESULTADOS["historias"]:
+                    st.warning(f"O pipeline terminou sem gerar histórias. Resposta do agente:\n\n{result['output']}")
+                else:
+                    st.success(f"Processamento Concluído com Sucesso! {result['output']}")
 
-                if "[SECAO_US]" in output_total:
-                    p_us = output_total.split("[SECAO_US]")[1]
-                    conteudo_us = p_us.split("[SECAO_METRICAS]")[0] if "[SECAO_METRICAS]" in p_us else p_us
-                
-                if "[SECAO_METRICAS]" in output_total:
-                    p_met = output_total.split("[SECAO_METRICAS]")[1]
-                    conteudo_metricas = p_met.split("[SECAO_AVALIADOR]")[0] if "[SECAO_AVALIADOR]" in p_met else p_met
-                
-                if "[SECAO_AVALIADOR]" in output_total:
-                    conteudo_avaliador = output_total.split("[SECAO_AVALIADOR]")[1]
-
-                if conteudo_metricas:
-                    conteudo_metricas = recalcular_metricas_markdown(conteudo_metricas)
+                conteudo_normativa = RESULTADOS["analise_normativa"] or "_A análise normativa não foi executada._"
+                conteudo_us = backlog_completo() or "_Nenhuma história gerada._"
+                conteudo_metricas = montar_secao_metricas() if (RESULTADOS["qus"] or RESULTADOS["invest"]) else "_As avaliações QUS/INVEST não foram executadas._"
+                conteudo_semantica = RESULTADOS["semantica"] or "_A validação semântica não foi executada._"
+                conteudo_cobertura = RESULTADOS["cobertura"]
 
                 tab0, tab1, tab2, tab3, tab4 = st.tabs([
                     "📋 Análise Normativa & Lacunas",
@@ -592,8 +649,12 @@ if st.button("🚀 Iniciar Pipeline de IA", use_container_width=True):
                 with tab0:
                     st.header("📋 Análise Normativa e Detecção de Omissões no Documento")
                     st.markdown(conteudo_normativa.strip())
+                    for i, relatorio_lacunas in enumerate(RESULTADOS["lacunas"], start=1):
+                        with st.expander(f"Verificação de lacunas — rodada {i}"):
+                            st.markdown(relatorio_lacunas)
                 with tab1:
                     st.header("📌 Backlog de User Stories Gerado")
+                    st.caption(f"{len(ids_no_backlog())} histórias no backlog")
                     st.markdown(conteudo_us.strip())
                     
                 with tab2:
@@ -612,7 +673,18 @@ if st.button("🚀 Iniciar Pipeline de IA", use_container_width=True):
                         """,
                         unsafe_allow_html=True,
                     )
-                    st.markdown(conteudo_avaliador.strip())
+                    st.markdown("#### 1. Relatório de Validação de Domínio e Nexo Semântico")
+                    st.markdown(conteudo_semantica.strip())
+
+                    st.markdown("#### 2. Matriz de Cobertura de Requisitos")
+                    if not conteudo_cobertura:
+                        st.markdown("_A matriz de cobertura não foi executada._")
+                    else:
+                        try:
+                            json_limpo = re.sub(r'^```(?:json)?\s*|\s*```$', '', conteudo_cobertura.strip())
+                            st.dataframe(json.loads(json_limpo), use_container_width=True)
+                        except ValueError:
+                            st.markdown(conteudo_cobertura)
                     
                 with tab4:
                     st.header("⚡ Desempenho Técnico do Pipeline")

@@ -21,6 +21,7 @@ from langchain.agents import AgentExecutor, create_openai_tools_agent
 from langchain_openai import ChatOpenAI
 from langchain.tools import tool
 from langchain_community.callbacks.manager import get_openai_callback
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_community.vectorstores import FAISS
 from langchain_openai import OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -449,7 +450,74 @@ Resultado da 'requirements_coverage_tool'.
 ])
 
 agent = create_openai_tools_agent(llm, toolkit, prompt)
-agent_executor = AgentExecutor(agent=agent, tools=toolkit, verbose=False, max_iterations=15)
+agent_executor = AgentExecutor(agent=agent, tools=toolkit, verbose=True, max_iterations=15)
+
+# --- ACOMPANHAMENTO EM TEMPO REAL ---
+class PipelineProgressHandler(BaseCallbackHandler):
+    """
+    Exibe na tela cada passo do agente com o tempo gasto:
+    - chamadas das ferramentas (entrada e saída resumidas);
+    - chamadas do LLM orquestrador entre as ferramentas ("agente decidindo/escrevendo").
+    """
+
+    LIMITE_PREVIA = 1500
+
+    def __init__(self, container):
+        self.container = container
+        self.passo = 0
+        self.ferramenta_ativa = None
+        self.agente_ativo = None
+
+    def _previa(self, texto) -> str:
+        texto = str(texto)
+        if len(texto) > self.LIMITE_PREVIA:
+            return texto[: self.LIMITE_PREVIA] + f"\n\n… ({len(texto)} caracteres no total)"
+        return texto
+
+    def on_llm_start(self, serialized, prompts, **kwargs):
+        # Chamadas internas das ferramentas não entram aqui como passo separado
+        if self.ferramenta_ativa is None:
+            self.passo += 1
+            status = self.container.status(f"🧠 {self.passo}. Agente decidindo o próximo passo...", expanded=False)
+            self.agente_ativo = (status, time.time(), self.passo)
+
+    on_chat_model_start = on_llm_start
+
+    def on_llm_end(self, response, **kwargs):
+        if self.agente_ativo is not None and self.ferramenta_ativa is None:
+            status, inicio, passo = self.agente_ativo
+            tokens_saida = (response.llm_output or {}).get("token_usage", {}).get("completion_tokens")
+            info_tokens = f" · {tokens_saida} tokens escritos" if tokens_saida else ""
+            status.update(
+                label=f"🧠 {passo}. Agente decidiu o próximo passo — {time.time() - inicio:.1f}s{info_tokens}",
+                state="complete",
+            )
+            self.agente_ativo = None
+
+    def on_tool_start(self, serialized, input_str, **kwargs):
+        self.passo += 1
+        nome = (serialized or {}).get("name", "ferramenta")
+        status = self.container.status(f"⏳ {self.passo}. Executando {nome}...", expanded=True)
+        status.caption(f"Entrada enviada pelo agente ({len(str(input_str))} caracteres):")
+        status.code(self._previa(input_str), language=None)
+        self.ferramenta_ativa = (status, time.time(), self.passo, nome)
+
+    def on_tool_end(self, output, **kwargs):
+        if self.ferramenta_ativa is None:
+            return
+        status, inicio, passo, nome = self.ferramenta_ativa
+        status.caption(f"Saída da ferramenta ({len(str(output))} caracteres):")
+        status.code(self._previa(output), language=None)
+        status.update(label=f"✅ {passo}. {nome} — {time.time() - inicio:.1f}s", state="complete", expanded=False)
+        self.ferramenta_ativa = None
+
+    def on_tool_error(self, error, **kwargs):
+        if self.ferramenta_ativa is None:
+            return
+        status, inicio, passo, nome = self.ferramenta_ativa
+        status.error(str(error))
+        status.update(label=f"❌ {passo}. {nome} — erro após {time.time() - inicio:.1f}s", state="error")
+        self.ferramenta_ativa = None
 
 # --- INTERFACE DO STREAMLIT ---
 
@@ -464,12 +532,19 @@ if st.button("🚀 Iniciar Pipeline de IA", use_container_width=True):
     tracemalloc.start()
     tempo_inicial = time.time()
     
+    # Acompanhamento em tempo real: cada ferramenta chamada pelo agente aparece abaixo com entrada e saída
+    st.markdown("#### 🛰️ Execução em tempo real")
+    st_callback = PipelineProgressHandler(st.container())
+
     with st.spinner("O Agente está processando o documento, mapeando todos os módulos e gerando o backlog completo... Aguarde."):
         with get_openai_callback() as cb:
             try:
-                result = agent_executor.invoke({
-                    "input": f"Execute todo o pipeline de engenharia de requisitos com auditoria semântica, de cobertura, QUS e INVEST para o projeto em: {url_documento}"
-                })
+                result = agent_executor.invoke(
+                    {
+                        "input": f"Execute todo o pipeline de engenharia de requisitos com auditoria semântica, de cobertura, QUS e INVEST para o projeto em: {url_documento}"
+                    },
+                    config={"callbacks": [st_callback]},
+                )
                 
                 tempo_final = time.time()
                 memoria_atual, memoria_pico = tracemalloc.get_traced_memory()

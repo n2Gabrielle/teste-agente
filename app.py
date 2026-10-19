@@ -10,8 +10,12 @@ sys.path.append(diretorio_atual)
 import time
 import tracemalloc
 import re
+import io
 import json
+from datetime import datetime
 import requests
+import pandas as pd
+from openpyxl.styles import Alignment, Font, PatternFill
 from bs4 import BeautifulSoup
 import streamlit as st
 from dotenv import load_dotenv
@@ -201,6 +205,119 @@ def montar_secao_metricas() -> str:
             f"| {f'{nota_i}/6' if nota_i is not None else '-'} | {falha_i} |"
         )
     return "\n".join(linhas)
+
+# --- EXPORTAÇÃO PARA EXCEL ---
+def _limpar_markdown(texto: str) -> str:
+    return re.sub(r'[*_`#]+', '', texto).strip().rstrip(',').strip()
+
+def estruturar_backlog() -> list:
+    """Converte o texto do backlog em linhas (módulo, ID, título, como, quero, para que, critérios)."""
+    padrao_modulo = re.compile(r'^\s*#+\s*Módulo\s*:?\s*(.+)$', re.IGNORECASE)
+    padrao_us = re.compile(r'^\W*(US-?\s*\d+)\s*[-–—:]\s*(.+)$', re.IGNORECASE)
+
+    linhas_saida = []
+    modulo_atual = ""
+    atual = None
+
+    for linha in backlog_completo().splitlines():
+        m_mod = padrao_modulo.match(linha)
+        m_us = padrao_us.match(linha)
+        if m_mod:
+            modulo_atual = _limpar_markdown(m_mod.group(1))
+        elif m_us:
+            atual = {
+                "Módulo": modulo_atual,
+                "ID": normalizar_id_us(m_us.group(1)),
+                "Título": _limpar_markdown(m_us.group(2)),
+                "Como (Persona)": "",
+                "Quero (Ação)": "",
+                "Para que (Benefício)": "",
+                "Critérios de Aceitação": [],
+            }
+            linhas_saida.append(atual)
+        elif atual is not None:
+            texto = _limpar_markdown(linha.lstrip("-* ").strip())
+            if re.match(r'^Como\b', texto, re.IGNORECASE):
+                atual["Como (Persona)"] = re.sub(r'^Como\s+', '', texto, flags=re.IGNORECASE)
+            elif re.match(r'^quero\b', texto, re.IGNORECASE):
+                atual["Quero (Ação)"] = re.sub(r'^quero\s+', '', texto, flags=re.IGNORECASE)
+            elif re.match(r'^para que\b', texto, re.IGNORECASE):
+                atual["Para que (Benefício)"] = re.sub(r'^para que\s+', '', texto, flags=re.IGNORECASE).rstrip('.')
+            elif re.match(r'^CA\s*\d+', texto, re.IGNORECASE):
+                atual["Critérios de Aceitação"].append(texto)
+
+    for item in linhas_saida:
+        item["Critérios de Aceitação"] = "\n".join(item["Critérios de Aceitação"])
+    return linhas_saida
+
+def _formatar_aba(planilha, larguras: dict):
+    cabecalho = PatternFill("solid", fgColor="1E293B")
+    for celula in planilha[1]:
+        celula.font = Font(bold=True, color="FFFFFF")
+        celula.fill = cabecalho
+        celula.alignment = Alignment(vertical="center", wrap_text=True)
+    for linha in planilha.iter_rows(min_row=2):
+        for celula in linha:
+            celula.alignment = Alignment(vertical="top", wrap_text=True)
+    for coluna, largura in larguras.items():
+        planilha.column_dimensions[coluna].width = largura
+    planilha.freeze_panes = "A2"
+
+def gerar_xlsx(info_execucao: dict) -> bytes:
+    """Gera a planilha com o backlog RAG ancorado, as métricas QUS/INVEST e a consolidação."""
+    backlog = estruturar_backlog()
+    if not backlog:
+        # Formato inesperado: exporta o texto bruto para não perder conteúdo
+        backlog = [{"Backlog (texto completo)": backlog_completo()}]
+    df_backlog = pd.DataFrame(backlog)
+
+    qus = extrair_notas(RESULTADOS["qus"], 7)
+    invest = extrair_notas(RESULTADOS["invest"], 6)
+    ids = ids_no_backlog()
+    df_metricas = pd.DataFrame([
+        {
+            "ID": us,
+            "Nota QUS (0-7)": qus[us][0] if us in qus else None,
+            "Falhas QUS": qus[us][1] if us in qus else "Não avaliada",
+            "Nota INVEST (0-6)": invest[us][0] if us in invest else None,
+            "Falhas INVEST": invest[us][1] if us in invest else "Não avaliada",
+        }
+        for us in ids
+    ])
+
+    total_qus, max_qus = sum(n for n, _ in qus.values()), len(qus) * 7
+    total_invest, max_invest = sum(n for n, _ in invest.values()), len(invest) * 6
+    nao_avaliadas = [us for us in ids if us not in qus or us not in invest]
+    df_consolidacao = pd.DataFrame(
+        [
+            ("Data/hora da execução", info_execucao["data_hora"]),
+            ("Documento de escopo (URL)", info_execucao["url"]),
+            ("Modelo", "gpt-4o-mini"),
+            ("Temperatura", info_execucao["temperatura"]),
+            ("Histórias no backlog", len(ids)),
+            ("MÉTRICAS QUS", f"{total_qus} / {max_qus}"),
+            ("QUS (%)", round(100 * total_qus / max_qus, 1) if max_qus else None),
+            ("MÉTRICAS INVEST", f"{total_invest} / {max_invest}"),
+            ("INVEST (%)", round(100 * total_invest / max_invest, 1) if max_invest else None),
+            ("Histórias sem nota QUS e/ou INVEST", ", ".join(nao_avaliadas) or "Nenhuma"),
+            ("Tempo total (s)", round(info_execucao["tempo_s"], 2)),
+            ("Tokens de entrada", info_execucao["tokens_entrada"]),
+            ("Tokens de saída", info_execucao["tokens_saida"]),
+            ("Custo estimado (USD)", round(info_execucao["custo_usd"], 5)),
+        ],
+        columns=["Métrica", "Valor"],
+    )
+
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df_backlog.to_excel(writer, sheet_name="Backlog RAG", index=False)
+        df_metricas.to_excel(writer, sheet_name="Métricas QUS-INVEST", index=False)
+        df_consolidacao.to_excel(writer, sheet_name="Consolidação", index=False)
+
+        _formatar_aba(writer.sheets["Backlog RAG"], {"A": 28, "B": 10, "C": 38, "D": 28, "E": 50, "F": 50, "G": 90})
+        _formatar_aba(writer.sheets["Métricas QUS-INVEST"], {"A": 10, "B": 15, "C": 35, "D": 17, "E": 35})
+        _formatar_aba(writer.sheets["Consolidação"], {"A": 38, "B": 70})
+    return buffer.getvalue()
 
 # --- FERRAMENTAS DO AGENTE ---
 @tool
@@ -631,6 +748,24 @@ if st.button("🚀 Iniciar Pipeline de IA", use_container_width=True):
                     st.warning(f"O pipeline terminou sem gerar histórias. Resposta do agente:\n\n{result['output']}")
                 else:
                     st.success(f"Processamento Concluído com Sucesso! {result['output']}")
+
+                    arquivo_xlsx = gerar_xlsx({
+                        "data_hora": datetime.now().strftime("%d/%m/%Y %H:%M"),
+                        "url": url_documento,
+                        "temperatura": temperatura,
+                        "tempo_s": tempo_final - tempo_inicial,
+                        "tokens_entrada": cb.prompt_tokens,
+                        "tokens_saida": cb.completion_tokens,
+                        "custo_usd": custo_real_calculado,
+                    })
+                    st.download_button(
+                        "📥 Exportar Backlog RAG e Métricas de Qualidade (.xlsx)",
+                        data=arquivo_xlsx,
+                        file_name=f"backlog_metricas_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        on_click="ignore",  # não reexecuta o app: os resultados continuam na tela após o download
+                        use_container_width=True,
+                    )
 
                 conteudo_normativa = RESULTADOS["analise_normativa"] or "_A análise normativa não foi executada._"
                 conteudo_us = backlog_completo() or "_Nenhuma história gerada._"

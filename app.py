@@ -343,11 +343,21 @@ def conectar_google_sheets():
     if credencial:
         cliente = gspread.service_account_from_dict(credencial)
     else:
-        caminho = os.getenv("GCP_SERVICE_ACCOUNT_FILE")
-        if not caminho or not os.path.exists(caminho):
+        caminho = (os.getenv("GCP_SERVICE_ACCOUNT_FILE") or "").strip().strip('"').strip("'")
+        if not caminho:
             raise RuntimeError(
-                "credencial do Google não configurada "
-                "(defina gcp_service_account nos Secrets ou GCP_SERVICE_ACCOUNT_FILE no .env)."
+                "credencial do Google não configurada: a variável GCP_SERVICE_ACCOUNT_FILE não foi encontrada "
+                "no .env (confira se o .env está salvo, na pasta do app.py, e reinicie o Streamlit) "
+                "nem há gcp_service_account nos Secrets."
+            )
+        # Caminho relativo é resolvido a partir da pasta do app.py, não da pasta onde o terminal está
+        if not os.path.isabs(caminho):
+            caminho = os.path.join(diretorio_atual, caminho)
+        if not os.path.exists(caminho):
+            arquivos_parecidos = [f for f in os.listdir(diretorio_atual) if f.lower().startswith("credenciais")]
+            raise RuntimeError(
+                f"arquivo de credencial não encontrado em: {caminho}. "
+                f"Arquivos 'credenciais*' na pasta do app: {arquivos_parecidos or 'nenhum'}."
             )
         cliente = gspread.service_account(filename=caminho)
 

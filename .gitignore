@@ -1,1 +1,4 @@
 .env
+# credenciais do Google (conta de serviço) e secrets do Streamlit: nunca versionar
+credenciais-google*.json
+.streamlit/secrets.toml

@@ -12,9 +12,11 @@ import tracemalloc
 import re
 import io
 import json
+import uuid
 from datetime import datetime
 import requests
 import pandas as pd
+import gspread
 from openpyxl.styles import Alignment, Font, PatternFill
 from bs4 import BeautifulSoup
 import streamlit as st
@@ -263,8 +265,8 @@ def _formatar_aba(planilha, larguras: dict):
         planilha.column_dimensions[coluna].width = largura
     planilha.freeze_panes = "A2"
 
-def gerar_xlsx(info_execucao: dict) -> bytes:
-    """Gera a planilha com o backlog RAG ancorado, as métricas QUS/INVEST e a consolidação."""
+def montar_tabelas_resultado(info_execucao: dict):
+    """Monta as tabelas (backlog, métricas e consolidação) usadas no .xlsx e no Google Sheets."""
     backlog = estruturar_backlog()
     if not backlog:
         # Formato inesperado: exporta o texto bruto para não perder conteúdo
@@ -307,6 +309,11 @@ def gerar_xlsx(info_execucao: dict) -> bytes:
         ],
         columns=["Métrica", "Valor"],
     )
+    return df_backlog, df_metricas, df_consolidacao
+
+def gerar_xlsx(info_execucao: dict) -> bytes:
+    """Gera a planilha com o backlog RAG ancorado, as métricas QUS/INVEST e a consolidação."""
+    df_backlog, df_metricas, df_consolidacao = montar_tabelas_resultado(info_execucao)
 
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
@@ -318,6 +325,103 @@ def gerar_xlsx(info_execucao: dict) -> bytes:
         _formatar_aba(writer.sheets["Métricas QUS-INVEST"], {"A": 10, "B": 15, "C": 35, "D": 17, "E": 35})
         _formatar_aba(writer.sheets["Consolidação"], {"A": 38, "B": 70})
     return buffer.getvalue()
+
+# --- HISTÓRICO NO GOOGLE SHEETS ---
+# Credencial: conta de serviço do Google, em st.secrets["gcp_service_account"] (Streamlit Cloud)
+# ou no arquivo indicado por GCP_SERVICE_ACCOUNT_FILE no .env (execução local).
+GOOGLE_SHEET_ID_PADRAO = "19od0s2vx4kGmD0r_2LKxWk7_BHiPRWkqGkezN2OTJmU"
+LIMITE_CELULA_SHEETS = 49000  # o Google Sheets aceita até 50.000 caracteres por célula
+
+def conectar_google_sheets():
+    credencial = None
+    try:
+        if "gcp_service_account" in st.secrets:
+            credencial = dict(st.secrets["gcp_service_account"])
+    except Exception:
+        pass
+
+    if credencial:
+        cliente = gspread.service_account_from_dict(credencial)
+    else:
+        caminho = os.getenv("GCP_SERVICE_ACCOUNT_FILE")
+        if not caminho or not os.path.exists(caminho):
+            raise RuntimeError(
+                "credencial do Google não configurada "
+                "(defina gcp_service_account nos Secrets ou GCP_SERVICE_ACCOUNT_FILE no .env)."
+            )
+        cliente = gspread.service_account(filename=caminho)
+
+    return cliente.open_by_key(os.getenv("GOOGLE_SHEET_ID") or GOOGLE_SHEET_ID_PADRAO)
+
+def _celula(valor):
+    if hasattr(valor, "item"):  # tipos numpy -> tipos Python
+        valor = valor.item()
+    if valor is None or (isinstance(valor, float) and pd.isna(valor)):
+        return ""
+    if isinstance(valor, str) and len(valor) > LIMITE_CELULA_SHEETS:
+        return valor[:LIMITE_CELULA_SHEETS] + " …[truncado]"
+    return valor
+
+def _obter_aba(planilha, nome: str, cabecalho: list):
+    try:
+        aba = planilha.worksheet(nome)
+    except gspread.WorksheetNotFound:
+        aba = planilha.add_worksheet(title=nome, rows=1000, cols=len(cabecalho))
+    if not aba.row_values(1):
+        aba.update(range_name="A1", values=[cabecalho])
+        aba.freeze(rows=1)
+        aba.format("1:1", {"textFormat": {"bold": True}})
+    return aba
+
+def _status_cobertura() -> str:
+    if not RESULTADOS["lacunas"]:
+        return "Não verificada"
+    if "COBERTURA_TOTAL_CONFIRMADA" in RESULTADOS["lacunas"][-1]:
+        return "Confirmada"
+    return f"Lacunas encontradas (última verificação de {len(RESULTADOS['lacunas'])})"
+
+def salvar_no_google_sheets(info_execucao: dict) -> str:
+    """Acrescenta a execução atual nas abas Execuções, Histórias e Relatórios. Devolve o ID da execução."""
+    df_backlog, df_metricas, df_consolidacao = montar_tabelas_resultado(info_execucao)
+    id_execucao = f"{datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:4]}"
+    data_hora = info_execucao["data_hora"]
+    planilha = conectar_google_sheets()
+
+    # Execuções: uma linha por execução, com a consolidação em colunas
+    consolidacao = dict(zip(df_consolidacao["Métrica"], df_consolidacao["Valor"]))
+    cab_exec = ["ID Execução", *consolidacao.keys(), "Status da cobertura"]
+    linha_exec = [id_execucao, *consolidacao.values(), _status_cobertura()]
+    _obter_aba(planilha, "Execuções", cab_exec).append_rows(
+        [[_celula(v) for v in linha_exec]], value_input_option="RAW"
+    )
+
+    # Histórias: uma linha por história, com as notas QUS/INVEST
+    df_historias = (
+        df_backlog.merge(df_metricas, on="ID", how="left") if "ID" in df_backlog.columns else df_metricas
+    )
+    cab_hist = ["ID Execução", "Data/hora", *df_historias.columns]
+    linhas_hist = [
+        [id_execucao, data_hora, *[_celula(v) for v in linha]]
+        for linha in df_historias.itertuples(index=False)
+    ]
+    if linhas_hist:
+        _obter_aba(planilha, "Histórias", cab_hist).append_rows(linhas_hist, value_input_option="RAW")
+
+    # Relatórios: textos completos produzidos pelas ferramentas
+    cab_rel = ["ID Execução", "Data/hora", "Análise Normativa", "Verificação de Lacunas",
+               "Validação Semântica", "Matriz de Cobertura", "Backlog (texto completo)"]
+    linha_rel = [
+        id_execucao, data_hora,
+        RESULTADOS["analise_normativa"],
+        "\n\n---\n\n".join(RESULTADOS["lacunas"]),
+        RESULTADOS["semantica"],
+        RESULTADOS["cobertura"],
+        backlog_completo(),
+    ]
+    _obter_aba(planilha, "Relatórios", cab_rel).append_rows(
+        [[_celula(v) for v in linha_rel]], value_input_option="RAW"
+    )
+    return id_execucao
 
 # --- FERRAMENTAS DO AGENTE ---
 @tool
@@ -749,7 +853,7 @@ if st.button("🚀 Iniciar Pipeline de IA", use_container_width=True):
                 else:
                     st.success(f"Processamento Concluído com Sucesso! {result['output']}")
 
-                    arquivo_xlsx = gerar_xlsx({
+                    info_execucao = {
                         "data_hora": datetime.now().strftime("%d/%m/%Y %H:%M"),
                         "url": url_documento,
                         "temperatura": temperatura,
@@ -757,7 +861,17 @@ if st.button("🚀 Iniciar Pipeline de IA", use_container_width=True):
                         "tokens_entrada": cb.prompt_tokens,
                         "tokens_saida": cb.completion_tokens,
                         "custo_usd": custo_real_calculado,
-                    })
+                    }
+
+                    # Histórico automático: falhas aqui não interrompem a exibição dos resultados
+                    try:
+                        with st.spinner("Salvando o resultado no Google Sheets..."):
+                            id_execucao = salvar_no_google_sheets(info_execucao)
+                        st.info(f"📚 Resultado salvo no Google Sheets (execução {id_execucao}).")
+                    except Exception as erro_sheets:
+                        st.warning(f"Não foi possível salvar no Google Sheets: {erro_sheets}")
+
+                    arquivo_xlsx = gerar_xlsx(info_execucao)
                     st.download_button(
                         "📥 Exportar Backlog RAG e Métricas de Qualidade (.xlsx)",
                         data=arquivo_xlsx,

@@ -22,16 +22,15 @@ from bs4 import BeautifulSoup
 import streamlit as st
 from dotenv import load_dotenv
 
+from langchain.agents import AgentExecutor, create_openai_tools_agent
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain.agents import AgentExecutor, create_openai_tools_agent
-from langchain_openai import ChatOpenAI
-from langchain.tools import tool
-from langchain_community.callbacks.manager import get_openai_callback
 from langchain_core.callbacks import BaseCallbackHandler
+from langchain_community.callbacks.manager import get_openai_callback
 from langchain_community.vectorstores import FAISS
-from langchain_openai import OpenAIEmbeddings
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.tools import tool
 
 VECTOR_STORE = None
 

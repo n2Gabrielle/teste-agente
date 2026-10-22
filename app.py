@@ -1,7 +1,6 @@
 import sys
 import os
 
-# Remove o diretório atual do topo da busca de caminhos do Python
 diretorio_atual = os.path.dirname(os.path.abspath(__file__))
 if diretorio_atual in sys.path:
     sys.path.remove(diretorio_atual)
@@ -22,7 +21,7 @@ from bs4 import BeautifulSoup
 import streamlit as st
 from dotenv import load_dotenv
 
-from langchain.agents import AgentExecutor, create_openai_tools_agent
+from langchain_core.tools import tool
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.callbacks import BaseCallbackHandler
@@ -30,7 +29,11 @@ from langchain_community.callbacks.manager import get_openai_callback
 from langchain_community.vectorstores import FAISS
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.tools import tool
+
+try:
+    from langchain.agents import AgentExecutor, create_openai_tools_agent
+except ImportError:
+    from langchain_classic.agents import AgentExecutor, create_openai_tools_agent
 
 VECTOR_STORE = None
 
